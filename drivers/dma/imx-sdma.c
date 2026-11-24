@@ -1107,6 +1107,54 @@ static int sdma_get_pc(struct sdma_channel *sdmac,
 	return 0;
 }
 
+struct sdma_iram_lookup {
+	phys_addr_t start, end;
+	bool found;
+};
+
+static void sdma_iram_chunk(struct gen_pool *pool, struct gen_pool_chunk *chunk,
+			    void *data)
+{
+	struct sdma_iram_lookup *l = data;
+	phys_addr_t base = chunk->phys_addr;
+	phys_addr_t last = base + (chunk->end_addr - chunk->start_addr);
+
+	if (l->start >= base && l->end <= last)
+		l->found = true;
+}
+
+/*
+ * The i.MX25 vendor BSP fed shared peripherals from on-chip RAM with the
+ * peripheral-DMA scripts per_2_shp/shp_2_per ("int_2_per"/"per_2_int"),
+ * reserving mcu_2_shp/shp_2_mcu for external memory. Do the same for SSI
+ * buffers in the "iram" pool.
+ */
+static void sdma_select_iram_script(struct sdma_channel *sdmac,
+				    dma_addr_t addr, size_t len)
+{
+	struct sdma_engine *sdma = sdmac->sdma;
+	struct sdma_iram_lookup l = { .start = addr, .end = addr + len - 1 };
+	s32 per_2_shp = sdma->script_addrs->per_2_shp_addr;
+	s32 shp_2_per = sdma->script_addrs->shp_2_per_addr;
+
+	if (!sdma->iram_pool || !len ||
+	    sdmac->peripheral_type != IMX_DMATYPE_SSI_SP)
+		return;
+
+	gen_pool_for_each_chunk(sdma->iram_pool, sdma_iram_chunk, &l);
+	if (!l.found)
+		return;
+
+	if (sdmac->direction == DMA_MEM_TO_DEV && per_2_shp > 0)
+		sdmac->pc_to_device = per_2_shp;
+	else if (sdmac->direction == DMA_DEV_TO_MEM && shp_2_per > 0)
+		sdmac->pc_from_device = shp_2_per;
+	else
+		return;
+	dev_info_once(sdma->dev, "channel %d: IRAM buffer, peripheral-DMA script\n",
+		      sdmac->channel);
+}
+
 static int sdma_load_context(struct sdma_channel *sdmac)
 {
 	struct sdma_engine *sdma = sdmac->sdma;
@@ -1740,6 +1788,7 @@ static struct dma_async_tx_descriptor *sdma_prep_dma_cyclic(
 		num_periods = buf_len / period_len;
 
 	sdma_config_write(chan, &sdmac->slave_config, direction);
+	sdma_select_iram_script(sdmac, dma_addr, buf_len);
 
 	desc = sdma_transfer_init(sdmac, direction, num_periods);
 	if (!desc)
