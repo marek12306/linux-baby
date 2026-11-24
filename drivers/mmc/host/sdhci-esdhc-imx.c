@@ -901,6 +901,16 @@ static void esdhc_writeb_le(struct sdhci_host *host, u8 val, int reg)
 		esdhc_clrset_le(host, mask, new_val, reg);
 		return;
 	case SDHCI_TIMEOUT_CONTROL:
+		/*
+		 * The i.MX25 eSDHC data timeout counter fires early for
+		 * DTOCV 12: SDIO writes to an AR6002 failed with a data
+		 * timeout after ~0.7 ms instead of 2^25 SDCLK, with the data
+		 * delivered. Freescale eSDHC erratum A001 (QorIQ) lists the
+		 * same for DTOCV 4, 8 and 12; skip to the next longer value,
+		 * as U-Boot does.
+		 */
+		if (is_imx25_esdhc(imx_data) && val && !(val % 4))
+			val++;
 		esdhc_clrset_le(host, ESDHC_SYS_CTRL_DTOCV_MASK,
 				FIELD_PREP(ESDHC_SYS_CTRL_DTOCV_MASK, val),
 				ESDHC_SYSTEM_CONTROL);
