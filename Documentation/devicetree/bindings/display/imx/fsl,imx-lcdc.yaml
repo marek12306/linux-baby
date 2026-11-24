@@ -58,7 +58,14 @@ properties:
   fsl,lpccr:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
-      Contrast Control Register value.
+      Contrast Control Register value. Linux can expose the contrast PWM
+      as a backlight whose brightness is the pulse width (bits 7:0).
+
+  backlight-low-power-gpios:
+    maxItems: 1
+    description:
+      GPIO selecting the panel's extra-low backlight current, asserted while
+      the contrast PWM backlight's bl_power is not "on".
 
   fsl,lscr1:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -77,7 +84,6 @@ allOf:
       properties:
         display: false
         fsl,dmacr: false
-        fsl,lpccr: false
         fsl,lscr1: false
 
       required:

@@ -8,3 +8,14 @@ config DRM_IMX_LCDC
       select DRM_BRIDGE_CONNECTOR
       help
         Found on i.MX1, i.MX21, i.MX25 and i.MX27.
+
+config DRM_IMX_LCDC_BACKLIGHT
+      bool "i.MX LCDC contrast PWM as backlight (legacy mxc_lcdc_bl ABI)"
+      depends on DRM_IMX_LCDC
+      depends on BACKLIGHT_CLASS_DEVICE=y || BACKLIGHT_CLASS_DEVICE=DRM_IMX_LCDC
+      help
+        Register the LCDC contrast PWM configured by fsl,lpccr as the
+        backlight device "mxc_lcdc_bl.0", with the brightness and bl_power
+        semantics of the Freescale 2.6 mxc_lcdc_bl driver used by the
+        Logitech Squeezebox Radio's SqueezePlay. An optional
+        backlight-low-power GPIO is asserted while bl_power is non-zero.

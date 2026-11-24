@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2020 Marian Cichy <M.Cichy@pengutronix.de>
 
 #include <drm/clients/drm_client_setup.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_damage_helper.h>
@@ -18,11 +19,15 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
+#include <linux/backlight.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/spinlock.h>
 
 #define IMX21LCDC_LSSAR         0x0000 /* LCDC Screen Start Address Register */
 #define IMX21LCDC_LSR           0x0004 /* LCDC Size Register */
@@ -88,6 +93,9 @@
 #define IMX21LCDC_LPCR_COLOR		BIT(30)
 #define IMX21LCDC_LPCR_TFT		BIT(31)
 
+/* Values for LPCCR Register */
+#define IMX21LCDC_LPCCR_PW		GENMASK(7, 0)
+
 #define INTR_EOF BIT(1) /* VBLANK Interrupt Bit */
 
 #define BPP_RGB565	0x05
@@ -108,6 +116,13 @@ struct imx_lcdc {
 	struct clk *clk_ipg;
 	struct clk *clk_ahb;
 	struct clk *clk_per;
+
+	/* fsl,lpccr; 0 if the board does not use the contrast PWM. */
+	u32 lpccr;
+	/* Protects lpccr and enabled; LPCCR is written only while clocked. */
+	spinlock_t lpccr_lock;
+	bool enabled;
+	struct gpio_desc *bl_low_power;
 };
 
 static const u32 imx_lcdc_formats[] = {
@@ -117,6 +132,15 @@ static const u32 imx_lcdc_formats[] = {
 static inline struct imx_lcdc *imx_lcdc_from_drmdev(struct drm_device *drm)
 {
 	return container_of(drm, struct imx_lcdc, drm);
+}
+
+static void imx_lcdc_set_enabled(struct imx_lcdc *lcdc, bool enabled)
+{
+	spin_lock(&lcdc->lpccr_lock);
+	lcdc->enabled = enabled;
+	if (enabled && lcdc->lpccr)
+		writel(lcdc->lpccr, lcdc->base + IMX21LCDC_LPCCR);
+	spin_unlock(&lcdc->lpccr_lock);
 }
 
 static unsigned int imx_lcdc_get_format(unsigned int drm_format)
@@ -134,57 +158,33 @@ static unsigned int imx_lcdc_get_format(unsigned int drm_format)
 	}
 }
 
-static void imx_lcdc_update_hw_registers(struct drm_simple_display_pipe *pipe,
-					 struct drm_plane_state *old_state,
-					 bool mode_set)
+/* Size, sync and line-stride registers; the caller keeps the PER clock off. */
+static void imx_lcdc_write_mode(struct imx_lcdc *lcdc,
+				const struct drm_display_mode *mode,
+				const struct drm_framebuffer *fb)
 {
-	struct drm_crtc *crtc = &pipe->crtc;
-	struct drm_plane_state *new_state = pipe->plane.state;
-	struct drm_framebuffer *fb = new_state->fb;
-	struct imx_lcdc *lcdc = imx_lcdc_from_drmdev(pipe->crtc.dev);
-	u32 lpcr, lvcr, lhcr;
+	u32 lvcr, lhcr;
 	u32 framesize;
-	dma_addr_t addr;
-
-	addr = drm_fb_dma_get_gem_addr(fb, new_state, 0);
-	/* The LSSAR register specifies the LCD screen start address (SSA). */
-	writel(addr, lcdc->base + IMX21LCDC_LSSAR);
-
-	if (!mode_set)
-		return;
-
-	/* Disable PER clock to make register write possible */
-	if (old_state && old_state->crtc && old_state->crtc->enabled)
-		clk_disable_unprepare(lcdc->clk_per);
 
 	/* Framesize */
-	framesize = FIELD_PREP(IMX21LCDC_LSR_XMAX, crtc->mode.hdisplay >> 4) |
-		FIELD_PREP(IMX21LCDC_LSR_YMAX, crtc->mode.vdisplay);
+	framesize = FIELD_PREP(IMX21LCDC_LSR_XMAX, mode->hdisplay >> 4) |
+		FIELD_PREP(IMX21LCDC_LSR_YMAX, mode->vdisplay);
 	writel(framesize, lcdc->base + IMX21LCDC_LSR);
 
 	/* HSYNC */
-	lhcr = FIELD_PREP(IMX21LCDC_LHCR_HFPORCH, crtc->mode.hsync_start - crtc->mode.hdisplay - 1) |
-		FIELD_PREP(IMX21LCDC_LHCR_HWIDTH, crtc->mode.hsync_end - crtc->mode.hsync_start - 1) |
-		FIELD_PREP(IMX21LCDC_LHCR_HBPORCH, crtc->mode.htotal - crtc->mode.hsync_end - 3);
+	lhcr = FIELD_PREP(IMX21LCDC_LHCR_HFPORCH, mode->hsync_start - mode->hdisplay - 1) |
+		FIELD_PREP(IMX21LCDC_LHCR_HWIDTH, mode->hsync_end - mode->hsync_start - 1) |
+		FIELD_PREP(IMX21LCDC_LHCR_HBPORCH, mode->htotal - mode->hsync_end - 3);
 	writel(lhcr, lcdc->base + IMX21LCDC_LHCR);
 
 	/* VSYNC */
-	lvcr = FIELD_PREP(IMX21LCDC_LVCR_VFPORCH, crtc->mode.vsync_start - crtc->mode.vdisplay) |
-		FIELD_PREP(IMX21LCDC_LVCR_VWIDTH, crtc->mode.vsync_end - crtc->mode.vsync_start) |
-		FIELD_PREP(IMX21LCDC_LVCR_VBPORCH, crtc->mode.vtotal - crtc->mode.vsync_end);
+	lvcr = FIELD_PREP(IMX21LCDC_LVCR_VFPORCH, mode->vsync_start - mode->vdisplay) |
+		FIELD_PREP(IMX21LCDC_LVCR_VWIDTH, mode->vsync_end - mode->vsync_start) |
+		FIELD_PREP(IMX21LCDC_LVCR_VBPORCH, mode->vtotal - mode->vsync_end);
 	writel(lvcr, lcdc->base + IMX21LCDC_LVCR);
 
-	lpcr = readl(lcdc->base + IMX21LCDC_LPCR);
-	lpcr &= ~IMX21LCDC_LPCR_BPIX;
-	lpcr |= FIELD_PREP(IMX21LCDC_LPCR_BPIX, imx_lcdc_get_format(fb->format->format));
-	writel(lpcr, lcdc->base + IMX21LCDC_LPCR);
-
 	/* Virtual Page Width */
-	writel(new_state->fb->pitches[0] / 4, lcdc->base + IMX21LCDC_LVPWR);
-
-	/* Enable PER clock */
-	if (new_state->crtc->enabled)
-		clk_prepare_enable(lcdc->clk_per);
+	writel(fb->pitches[0] / 4, lcdc->base + IMX21LCDC_LVPWR);
 }
 
 static void imx_lcdc_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -225,9 +225,21 @@ static void imx_lcdc_pipe_enable(struct drm_simple_display_pipe *pipe,
 	writel(0x00000000, lcdc->base + IMX21LCDC_LPOR);
 
 	/* disable hardware cursor */
-	writel(readl(lcdc->base + IMX21LCDC_LCPR) & ~(IMX21LCDC_LCPR_CC0 | IMX21LCDC_LCPR_CC1),
-	       lcdc->base + IMX21LCDC_LCPR);
+	writel(0, lcdc->base + IMX21LCDC_LCPR);
 
+	/* The LSSAR register specifies the LCD screen start address (SSA). */
+	writel(drm_fb_dma_get_gem_addr(plane_state->fb, plane_state, 0),
+	       lcdc->base + IMX21LCDC_LSSAR);
+	imx_lcdc_write_mode(lcdc, mode, plane_state->fb);
+
+	/*
+	 * The controller starts scanning once its clocks run, so program it
+	 * completely with all clocks off, then enable ipg, ahb and per, as
+	 * imxfb does. On i.MX25, an LCDC stalled by clocks enabled before
+	 * programming (no EOF interrupt, panel stays white) did not recover
+	 * when the mode was written with ipg and ahb running, but did with
+	 * this order.
+	 */
 	ret = clk_prepare_enable(lcdc->clk_ipg);
 	if (ret) {
 		dev_err(pipe->crtc.dev->dev, "Cannot enable ipg clock: %pe\n", ERR_PTR(ret));
@@ -241,8 +253,17 @@ static void imx_lcdc_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 		return;
 	}
+	ret = clk_prepare_enable(lcdc->clk_per);
+	if (ret) {
+		dev_err(pipe->crtc.dev->dev, "Cannot enable per clock: %pe\n", ERR_PTR(ret));
 
-	imx_lcdc_update_hw_registers(pipe, NULL, true);
+		clk_disable_unprepare(lcdc->clk_ahb);
+		clk_disable_unprepare(lcdc->clk_ipg);
+
+		return;
+	}
+
+	imx_lcdc_set_enabled(lcdc, true);
 
 	/* Enable VBLANK Interrupt */
 	writel(INTR_EOF, lcdc->base + IMX21LCDC_LIER);
@@ -254,11 +275,14 @@ static void imx_lcdc_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct drm_crtc *crtc = &lcdc->pipe.crtc;
 	struct drm_pending_vblank_event *event;
 
+	/* Disable VBLANK Interrupt */
+	writel(0, lcdc->base + IMX21LCDC_LIER);
+
+	imx_lcdc_set_enabled(lcdc, false);
+
+	clk_disable_unprepare(lcdc->clk_per);
 	clk_disable_unprepare(lcdc->clk_ahb);
 	clk_disable_unprepare(lcdc->clk_ipg);
-
-	if (pipe->crtc.enabled)
-		clk_disable_unprepare(lcdc->clk_per);
 
 	spin_lock_irq(&lcdc->drm.event_lock);
 	event = crtc->state->event;
@@ -267,9 +291,6 @@ static void imx_lcdc_pipe_disable(struct drm_simple_display_pipe *pipe)
 		drm_crtc_send_vblank_event(crtc, event);
 	}
 	spin_unlock_irq(&lcdc->drm.event_lock);
-
-	/* Disable VBLANK Interrupt */
-	writel(0, lcdc->base + IMX21LCDC_LIER);
 }
 
 static int imx_lcdc_pipe_check(struct drm_simple_display_pipe *pipe,
@@ -297,20 +318,38 @@ static int imx_lcdc_pipe_check(struct drm_simple_display_pipe *pipe,
 static void imx_lcdc_pipe_update(struct drm_simple_display_pipe *pipe,
 				 struct drm_plane_state *old_state)
 {
+	struct imx_lcdc *lcdc = imx_lcdc_from_drmdev(pipe->crtc.dev);
 	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	struct drm_plane_state *new_state = pipe->plane.state;
 	struct drm_framebuffer *fb = new_state->fb;
 	struct drm_framebuffer *old_fb = old_state->fb;
-	struct drm_crtc *old_crtc = old_state->crtc;
-	bool mode_changed = false;
 
-	if (old_fb && old_fb->format != fb->format)
-		mode_changed = true;
-	else if (old_crtc != crtc)
-		mode_changed = true;
+	writel(drm_fb_dma_get_gem_addr(fb, new_state, 0),
+	       lcdc->base + IMX21LCDC_LSSAR);
 
-	imx_lcdc_update_hw_registers(pipe, old_state, mode_changed);
+	/*
+	 * pipe_enable() programs a pipe enabled by this commit. A format or
+	 * stride change on a running pipe needs PER off while LPCR and LVPWR
+	 * change.
+	 */
+	if (!drm_atomic_crtc_needs_modeset(crtc->state) && old_fb &&
+	    (old_fb->format != fb->format ||
+	     old_fb->pitches[0] != fb->pitches[0])) {
+		u32 lpcr;
+
+		clk_disable_unprepare(lcdc->clk_per);
+
+		lpcr = readl(lcdc->base + IMX21LCDC_LPCR);
+		lpcr &= ~IMX21LCDC_LPCR_BPIX;
+		lpcr |= FIELD_PREP(IMX21LCDC_LPCR_BPIX,
+				   imx_lcdc_get_format(fb->format->format));
+		writel(lpcr, lcdc->base + IMX21LCDC_LPCR);
+		writel(fb->pitches[0] / 4, lcdc->base + IMX21LCDC_LVPWR);
+
+		if (clk_prepare_enable(lcdc->clk_per))
+			drm_err(crtc->dev, "Cannot enable per clock\n");
+	}
 
 	if (event) {
 		crtc->state->event = NULL;
@@ -334,7 +373,11 @@ static const struct drm_simple_display_pipe_funcs imx_lcdc_pipe_funcs = {
 };
 
 static const struct drm_mode_config_funcs imx_lcdc_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create_with_dirty,
+	/*
+	 * The LCDC scans out continuously from memory, so framebuffers need no
+	 * dirty handling and fbdev emulation maps the scanout buffer directly.
+	 */
+	.fb_create = drm_gem_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -364,6 +407,98 @@ static const struct of_device_id imx_lcdc_of_dev_id[] = {
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, imx_lcdc_of_dev_id);
+
+#if IS_ENABLED(CONFIG_DRM_IMX_LCDC_BACKLIGHT)
+/*
+ * Freescale 2.6 mxc_lcdc_bl semantics, as used by SqueezePlay: brightness is
+ * the LPCCR pulse width; bl_power 4 turns the backlight off, and any non-zero
+ * bl_power drives the panel's low-current (dim) GPIO.
+ *
+ * BL_CORE_FBBLANK is set by backlight_disable() when the panel is disabled
+ * and cleared by backlight_enable() once it is initialized again. It keeps
+ * the backlight dark meanwhile, whatever userspace writes to bl_power
+ * (SqueezePlay's automatic brightness does so continuously).
+ */
+static int imx_lcdc_bl_update_status(struct backlight_device *bl)
+{
+	struct imx_lcdc *lcdc = bl_get_data(bl);
+	u32 level = bl->props.brightness;
+
+	if (bl->props.power == BACKLIGHT_POWER_OFF ||
+	    bl->props.state & (BL_CORE_FBBLANK | BL_CORE_SUSPENDED))
+		level = 0;
+
+	spin_lock(&lcdc->lpccr_lock);
+	lcdc->lpccr = (lcdc->lpccr & ~IMX21LCDC_LPCCR_PW) |
+		      FIELD_PREP(IMX21LCDC_LPCCR_PW, level);
+	if (lcdc->enabled)
+		writel(lcdc->lpccr, lcdc->base + IMX21LCDC_LPCCR);
+	spin_unlock(&lcdc->lpccr_lock);
+
+	gpiod_set_value_cansleep(lcdc->bl_low_power,
+				 bl->props.power != BACKLIGHT_POWER_ON);
+
+	return 0;
+}
+
+static int imx_lcdc_bl_get_brightness(struct backlight_device *bl)
+{
+	struct imx_lcdc *lcdc = bl_get_data(bl);
+
+	return FIELD_GET(IMX21LCDC_LPCCR_PW, READ_ONCE(lcdc->lpccr));
+}
+
+static const struct backlight_ops imx_lcdc_bl_ops = {
+	.update_status = imx_lcdc_bl_update_status,
+	.get_brightness = imx_lcdc_bl_get_brightness,
+};
+
+static int imx_lcdc_init_backlight(struct imx_lcdc *lcdc)
+{
+	struct device *dev = lcdc->drm.dev;
+	/*
+	 * Start dark: the panel enables the backlight through
+	 * drm_panel_enable() once it shows valid frames, as legacy enabled
+	 * mxc_lcdc_bl only after the display (fix-lcd-white-flash.patch).
+	 * The fsl,lpccr pulse width becomes the initial brightness, and
+	 * bl_power reads 0 as on legacy.
+	 */
+	struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		.max_brightness = FIELD_MAX(IMX21LCDC_LPCCR_PW),
+		.brightness = FIELD_GET(IMX21LCDC_LPCCR_PW, lcdc->lpccr),
+		.power = BACKLIGHT_POWER_ON,
+		.state = BL_CORE_FBBLANK,
+	};
+	struct backlight_device *bl;
+
+	/* Only boards that configure the contrast PWM use it as backlight. */
+	if (!lcdc->lpccr)
+		return 0;
+
+	lcdc->lpccr &= ~IMX21LCDC_LPCCR_PW;
+
+	lcdc->bl_low_power = devm_gpiod_get_optional(dev, "backlight-low-power",
+						     GPIOD_OUT_LOW);
+	if (IS_ERR(lcdc->bl_low_power))
+		return dev_err_probe(dev, PTR_ERR(lcdc->bl_low_power),
+				     "backlight low-power GPIO\n");
+
+	/* SqueezePlay opens /sys/class/backlight/mxc_lcdc_bl.0. */
+	bl = devm_backlight_device_register(dev, "mxc_lcdc_bl.0", dev, lcdc,
+					    &imx_lcdc_bl_ops, &props);
+	if (IS_ERR(bl))
+		return dev_err_probe(dev, PTR_ERR(bl),
+				     "failed to register backlight\n");
+
+	return 0;
+}
+#else
+static int imx_lcdc_init_backlight(struct imx_lcdc *lcdc)
+{
+	return 0;
+}
+#endif
 
 static irqreturn_t imx_lcdc_irq_handler(int irq, void *arg)
 {
@@ -418,6 +553,13 @@ static int imx_lcdc_probe(struct platform_device *pdev)
 	if (IS_ERR(lcdc->clk_per))
 		return dev_err_probe(dev, PTR_ERR(lcdc->clk_per), "Failed to get %s clk\n", "per");
 
+	spin_lock_init(&lcdc->lpccr_lock);
+	device_property_read_u32(dev, "fsl,lpccr", &lcdc->lpccr);
+
+	ret = imx_lcdc_init_backlight(lcdc);
+	if (ret)
+		return ret;
+
 	ret = dma_set_mask_and_coherent(drm->dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "Cannot set DMA Mask\n");
@@ -454,25 +596,16 @@ static int imx_lcdc_probe(struct platform_device *pdev)
 	 * programmed with proper register values (enabled at the
 	 * bootloader, for example) then it just goes into some undefined
 	 * state.
-	 * To avoid this issue, let's enable and disable LCDC IPG,
-	 * PER and AHB clock so that we force some kind of 'reset'
-	 * to the LCDC block.
+	 * To avoid this issue, let's enable and disable LCDC IPG clock
+	 * so that we force some kind of 'reset' to the LCDC block. As in
+	 * imxfb, PER and AHB are not toggled: enabling them on the
+	 * unprogrammed controller stalls an i.MX25 LCDC.
 	 */
 
 	ret = clk_prepare_enable(lcdc->clk_ipg);
 	if (ret)
 		return dev_err_probe(dev, ret, "Cannot enable ipg clock\n");
 	clk_disable_unprepare(lcdc->clk_ipg);
-
-	ret = clk_prepare_enable(lcdc->clk_per);
-	if (ret)
-		return dev_err_probe(dev, ret, "Cannot enable per clock\n");
-	clk_disable_unprepare(lcdc->clk_per);
-
-	ret = clk_prepare_enable(lcdc->clk_ahb);
-	if (ret)
-		return dev_err_probe(dev, ret, "Cannot enable ahb clock\n");
-	clk_disable_unprepare(lcdc->clk_ahb);
 
 	drm->mode_config.min_width = LCDC_MIN_XRES;
 	drm->mode_config.max_width = LCDC_MAX_XRES;
