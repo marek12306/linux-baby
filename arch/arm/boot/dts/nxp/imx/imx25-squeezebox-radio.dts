@@ -156,6 +156,19 @@
 			debounce-interval = <50>;
 		};
 	};
+
+	/*
+	 * AR6002 (AR6102 module) on ESDHC1. Legacy mx25_baby_gpio.c drives
+	 * WLAN_POWER_DOWN_BAR (CSI_D9) low for 10 ms and then high, and holds
+	 * WLAN_RESET_BAR (D15) high; neither line is touched afterwards.
+	 */
+	wlan_pwrseq: pwrseq-wlan {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_wlan>;
+		reset-gpios = <&gpio4 21 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <10>;
+	};
 };
 
 &iomuxc {
@@ -169,6 +182,29 @@
 			MX25_PAD_D12__GPIO_4_8		0x00000100
 			MX25_PAD_D13__GPIO_4_7		0x00000100
 			MX25_PAD_GPIO_A__GPIO_1_0	0x000000f0
+		>;
+	};
+
+	pinctrl_esdhc1: esdhc1grp {
+		fsl,pins = <
+			/*
+			 * Legacy SDHC_PAD_CTL: 47K pull-up, fast slew, normal
+			 * drive; SION on CMD (in the mux value) and CLK.
+			 */
+			MX25_PAD_SD1_CMD__ESDHC1_CMD	0x000000d1
+			MX25_PAD_SD1_CLK__ESDHC1_CLK	0x400000d1
+			MX25_PAD_SD1_DATA0__ESDHC1_DAT0	0x000000d1
+			MX25_PAD_SD1_DATA1__ESDHC1_DAT1	0x000000d1
+			MX25_PAD_SD1_DATA2__ESDHC1_DAT2	0x000000d1
+			MX25_PAD_SD1_DATA3__ESDHC1_DAT3	0x000000d1
+		>;
+	};
+
+	pinctrl_wlan: wlangrp {
+		fsl,pins = <
+			/* Legacy PAD_CTL_DRV_3_3V only: no pull/keeper. */
+			MX25_PAD_CSI_D9__GPIO_4_21	0x00000000
+			MX25_PAD_D15__GPIO_4_5		0x00000000
 		>;
 	};
 
@@ -314,6 +350,36 @@
 &uart2 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_uart2>;
+	status = "okay";
+};
+
+/* WLAN_RESET_BAR stays deasserted, as in legacy board code. */
+&gpio4 {
+	wlan-reset-hog {
+		gpio-hog;
+		gpios = <5 GPIO_ACTIVE_LOW>;
+		output-low;
+		line-name = "wlan-reset";
+	};
+};
+
+/*
+ * Legacy: SDHC1, 4-bit, no card detect (always present), 3.3 V, PIO only
+ * (wlan-atheros.patch forces SDHCI_QUIRK_ONLY_PIO). With SDMA, 4-byte reads
+ * of the AR6002 mailbox registers returned wrong data while a 64-byte read
+ * of the same registers was correct (hardware, 2026-11-24); masking
+ * SDHCI_CAN_DO_SDMA makes sdhci use PIO.
+ */
+&esdhc1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_esdhc1>;
+	bus-width = <4>;
+	non-removable;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	no-1-8-v;
+	sdhci-caps-mask = <0x0 0x00400000>;
+	mmc-pwrseq = <&wlan_pwrseq>;
 	status = "okay";
 };
 
