@@ -2,6 +2,7 @@
 #ifndef __ASM_ARM_SYSTEM_INFO_H
 #define __ASM_ARM_SYSTEM_INFO_H
 
+#include <linux/types.h>
 #define CPU_ARCH_UNKNOWN	0
 #define CPU_ARCH_ARMv3		1
 #define CPU_ARCH_ARMv4		2
@@ -21,6 +22,8 @@ extern unsigned int system_rev;
 extern const char *system_serial;
 extern unsigned int system_serial_low;
 extern unsigned int system_serial_high;
+extern u8 system_uuid[16];
+extern bool system_uuid_valid;
 extern unsigned int mem_fclk_21285;
 
 extern int __pure cpu_architecture(void);

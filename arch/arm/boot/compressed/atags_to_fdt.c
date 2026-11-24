@@ -11,6 +11,8 @@
 #endif
 
 #define NR_BANKS 16
+#define ATAG_LOGITECH_UUID	0x54410100
+
 
 static int node_offset(void *fdt, const char *node_path)
 {
@@ -206,6 +208,12 @@ int atags_to_fdt(void *atag_list, void *fdt, int total_space)
 			hex_str(serno, atag->u.serialnr.high);
 			hex_str(serno+8, atag->u.serialnr.low);
 			setprop_string(fdt, "/", "serial-number", serno);
+		} else if (atag->hdr.tag == ATAG_REVISION) {
+			setprop_cell(fdt, "/chosen", "logitech,system-revision",
+				     atag->u.revision.rev);
+		} else if (atag->hdr.tag == ATAG_LOGITECH_UUID) {
+			setprop(fdt, "/chosen", "logitech,system-uuid",
+				(void *)&atag->u, 16);
 		}
 	}
 

@@ -97,6 +97,11 @@ EXPORT_SYMBOL(system_serial_low);
 unsigned int system_serial_high;
 EXPORT_SYMBOL(system_serial_high);
 
+u8 system_uuid[16];
+EXPORT_SYMBOL(system_uuid);
+bool system_uuid_valid;
+EXPORT_SYMBOL(system_uuid_valid);
+
 unsigned int elf_hwcap __read_mostly;
 EXPORT_SYMBOL(elf_hwcap);
 
@@ -1317,6 +1322,15 @@ static int c_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "Hardware\t: %s\n", machine_name);
 	seq_printf(m, "Revision\t: %04x\n", system_rev);
+	if (system_uuid_valid) {
+		seq_puts(m, "UUID\t\t: ");
+		for (i = 0; i < ARRAY_SIZE(system_uuid); i++) {
+			seq_printf(m, "%02x", system_uuid[i]);
+			if (i == 3 || i == 5 || i == 7 || i == 9)
+				seq_putc(m, '-');
+		}
+		seq_putc(m, '\n');
+	}
 	seq_printf(m, "Serial\t\t: %s\n", system_serial);
 
 	return 0;
