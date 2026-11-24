@@ -79,6 +79,7 @@ static void __init __mx25_clocks_init(void __iomem *ccm_base)
 	BUG_ON(!ccm_base);
 
 	clk[dummy] = imx_clk_fixed("dummy", 0);
+	clk[osc] = imx_obtain_fixed_clock("osc", 0);
 	clk[mpll] = imx_clk_pllv1(IMX_PLLV1_IMX25, "mpll", "osc", ccm(CCM_MPCTL));
 	clk[upll] = imx_clk_pllv1(IMX_PLLV1_IMX25, "upll", "osc", ccm(CCM_UPCTL));
 	clk[mpll_cpu_3_4] = imx_clk_fixed_factor("mpll_cpu_3_4", "mpll", 3, 4);
