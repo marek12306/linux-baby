@@ -8,6 +8,7 @@
 
 #define pr_fmt(fmt) "genirq: " fmt
 
+#include <linux/ctype.h>
 #include <linux/irq.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
@@ -34,6 +35,91 @@ static int __init setup_forced_irqthreads(char *arg)
 }
 early_param("threadirqs", setup_forced_irqthreads);
 #endif
+
+/*
+ * SCHED_FIFO priorities for interrupt threads, selected by the name passed to
+ * request_irq(). Format: "name:prio[,name:prio...][,prio]". A bare prio
+ * applies to every unlisted thread; without one, unlisted threads keep the
+ * MAX_RT_PRIO / 2 default. irq_thread_prio= overrides the Kconfig string.
+ */
+static const char *irq_thread_prio_map __ro_after_init = CONFIG_IRQ_THREAD_PRIORITIES;
+
+static int __init setup_irq_thread_prio(char *arg)
+{
+	irq_thread_prio_map = arg;
+	return 1;
+}
+__setup("irq_thread_prio=", setup_irq_thread_prio);
+
+/* Decimal SCHED_FIFO priority in [s, end), or 0 if invalid */
+static int irq_thread_parse_prio(const char *s, const char *end)
+{
+	int prio = 0;
+
+	if (s == end)
+		return 0;
+	for (; s < end; s++) {
+		if (!isdigit(*s))
+			return 0;
+		prio = prio * 10 + (*s - '0');
+		if (prio >= MAX_RT_PRIO)
+			return 0;
+	}
+	return prio;
+}
+
+/* Mapped priority for an interrupt thread named @name, or 0 for the default */
+static int irq_thread_map_prio(const char *name)
+{
+	size_t len = name ? strlen(name) : 0;
+	const char *p = irq_thread_prio_map;
+	int fallback = 0;
+
+	while (*p) {
+		const char *end = strchrnul(p, ',');
+		const char *colon = end;
+		int prio;
+
+		/* Last colon, so that names containing ':' still match */
+		while (colon > p && *colon != ':')
+			colon--;
+
+		if (*colon == ':') {
+			prio = irq_thread_parse_prio(colon + 1, end);
+			if (prio && len && (size_t)(colon - p) == len &&
+			    !memcmp(p, name, len))
+				return prio;
+		} else {
+			prio = irq_thread_parse_prio(p, end);
+			if (prio)
+				fallback = prio;
+		}
+		if (!prio)
+			pr_warn_once("irq_thread_prio: invalid entry '%.*s'\n",
+				     (int)(end - p), p);
+		p = *end ? end + 1 : end;
+	}
+	return fallback;
+}
+
+/* Secondary threads run one level below their primary, as by default */
+static void irq_thread_set_prio(struct irqaction *action, bool secondary)
+{
+	struct sched_param sp = {
+		.sched_priority = irq_thread_map_prio(action->name),
+	};
+
+	if (!sp.sched_priority) {
+		if (secondary)
+			sched_set_fifo_secondary(current);
+		else
+			sched_set_fifo(current);
+		return;
+	}
+	if (secondary && sp.sched_priority > 1)
+		sp.sched_priority--;
+	WARN_ON_ONCE(sched_setscheduler_nocheck(current, SCHED_FIFO, &sp));
+}
 
 #ifdef CONFIG_SMP
 static inline void synchronize_irqwork(struct irq_desc *desc)
@@ -1252,10 +1338,8 @@ static int irq_thread(void *data)
 
 	irq_thread_set_ready(desc, action);
 
-	if (action->handler == irq_forced_secondary_handler)
-		sched_set_fifo_secondary(current);
-	else
-		sched_set_fifo(current);
+	irq_thread_set_prio(action,
+			    action->handler == irq_forced_secondary_handler);
 
 	if (force_irqthreads() && test_bit(IRQTF_FORCED_THREAD,
 					   &action->thread_flags))

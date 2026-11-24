@@ -2740,6 +2740,14 @@ Kernel parameters
 			an audit event when a binary is allowed. The default
 			is 0.
 
+	irq_thread_prio=
+			[KNL] SCHED_FIFO priorities for interrupt threads,
+			selected by the name passed to request_irq().
+			Format: <name>:<prio>[,<name>:<prio>...][,<prio>]
+			A bare <prio> (1-99) applies to all unlisted
+			threads. Overrides CONFIG_IRQ_THREAD_PRIORITIES.
+			Example: irq_thread_prio=53fd4000.dma-controller:90,40
+
 	irqaffinity=	[SMP] Set the default irq affinity mask
 			The argument is a cpu list, as described above.
 

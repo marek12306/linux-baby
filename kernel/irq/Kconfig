@@ -106,6 +106,22 @@ config GENERIC_IRQ_STAT_SNAPSHOT
 config IRQ_FORCED_THREADING
        bool
 
+config IRQ_THREAD_PRIORITIES
+	string "Interrupt thread priority map"
+	default ""
+	help
+	  SCHED_FIFO priorities for interrupt threads, selected by the name
+	  passed to request_irq(), in the form "name:prio[,name:prio...][,prio]".
+	  A bare prio applies to every unlisted thread; without one they keep
+	  the default of 50. Secondary threads of forced-threaded handlers run
+	  one level below their primary. The irq_thread_prio= boot parameter
+	  overrides this string.
+
+	  Only threaded handlers are affected; with PREEMPT_RT or threadirqs
+	  that is every handler not marked IRQF_NO_THREAD.
+
+	  Example: "53fd4000.dma-controller:90,40"
+
 config SPARSE_IRQ
 	bool "Support sparse irq numbering" if MAY_HAVE_SPARSE_IRQ
 	help
