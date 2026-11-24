@@ -586,4 +586,17 @@ source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
 source "drivers/misc/issei/Kconfig"
+config SQUEEZEBOX_MSP430
+	tristate "Logitech Squeezebox Radio MSP430 support"
+	depends on I2C && OF && RTC_CLASS
+	help
+	  Say Y here to support the MSP430 companion controller in the
+	  Logitech Squeezebox Radio. It reports rotary encoder, IR and battery
+	  events, exposes battery and charger telemetry and the wake alarm,
+	  provides an RTC and powers the system off.
+
+	  The input device, sysfs attributes and paths follow the SqueezeOS
+	  2.6.26 ABI used by SqueezePlay. Charger controls and MSP430 firmware
+	  programming are not exposed.
+
 endmenu
