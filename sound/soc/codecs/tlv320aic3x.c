@@ -82,6 +82,12 @@ struct aic3x_priv {
 	struct gpio_desc *gpio_reset;
 	bool shared_reset;
 	int power;
+	/*
+	 * Playback stream is mono: both DACs play the first slot. Taken from
+	 * the runtime in prepare: with a TDM slot mask, ASoC passes hw_params
+	 * the slot count instead of the stream's channel count.
+	 */
+	bool mono_playback;
 	u16 model;
 
 	/* Selects the micbias voltage */
@@ -1115,9 +1121,12 @@ static int aic3x_hw_params(struct snd_pcm_substream *substream,
 				    PLL_ENABLE, PLL_ENABLE);
 	}
 
-	/* Route Left DAC to left channel input and
-	 * right DAC to right channel input */
-	data = (LDAC2LCH | RDAC2RCH);
+	/*
+	 * Route the left DAC to left channel data. The right DAC takes right
+	 * channel data, or left channel data for mono playback (see
+	 * aic3x_prepare()).
+	 */
+	data = LDAC2LCH | (aic3x->mono_playback ? RDAC2LCH : RDAC2RCH);
 	data |= (fsref == 44100) ? FSREF_44100 : FSREF_48000;
 	if (dual_rate)
 		data |= DUAL_RATE_MODE;
@@ -1230,6 +1239,16 @@ static int aic3x_prepare(struct snd_pcm_substream *substream,
 
 	/* Configure data delay */
 	snd_soc_component_write(component, AIC3X_ASD_INTF_CTRLC, delay);
+
+	/* Mono playback carries a sample in the first slot only. */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		aic3x->mono_playback = substream->runtime->channels == 1;
+		snd_soc_component_update_bits(component,
+					      AIC3X_CODEC_DATAPATH_REG,
+					      RDAC_PATH_MASK,
+					      aic3x->mono_playback ?
+					      RDAC2LCH : RDAC2RCH);
+	}
 
 	return 0;
 }
@@ -1514,7 +1533,7 @@ static struct snd_soc_dai_driver aic3x_dai = {
 	.name = "tlv320aic3x-hifi",
 	.playback = {
 		.stream_name = "Playback",
-		.channels_min = 2,
+		.channels_min = 1,
 		.channels_max = 2,
 		.rates = AIC3X_RATES,
 		.formats = AIC3X_FORMATS,},

@@ -191,6 +191,7 @@ void aic3x_remove(struct device *dev);
 #define RDAC2LCH		(0x2 << 1)
 #define LDAC2MONOMIX		(0x3 << 3)
 #define RDAC2MONOMIX		(0x3 << 1)
+#define RDAC_PATH_MASK		(0x3 << 1)
 
 /* PLL registers bitfields */
 #define PLLP_SHIFT		0
