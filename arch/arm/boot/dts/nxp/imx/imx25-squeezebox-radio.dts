@@ -1,0 +1,492 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Logitech Squeezebox Radio ("Baby"), board revision 7 as reported by RedBoot.
+ *
+ * RedBoot boots zImage from RAM with this DTB appended; its ATAGs supply the
+ * memory range, command line, board revision and UUID. Hardware values are
+ * traced to the legacy 2.6.26 SqueezeOS board code and patches
+ * (mx25_baby*.c, baby-*.patch). No FEC PHY reset GPIO is described: legacy
+ * code leaves PHY reset to the bootloader.
+ */
+
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/input/input.h>
+
+#include "imx25.dtsi"
+
+/ {
+	model = "Logitech Squeezebox Radio";
+	compatible = "logitech,squeezebox-radio", "fsl,imx25";
+
+	/*
+	 * The appended-DTB boot on 2026-07-28 reached mainline Linux with
+	 * the RedBoot ATAG memory range converted to 0x80000000-0x83ffffff.
+	 * RedBoot's `version` display instead reports its logical RAM window
+	 * as 0x00000000-0x03f00000; retain the physical range observed by
+	 * Linux and keep ATAG-to-FDT compatibility enabled.
+	 */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x04000000>;
+	};
+
+	chosen {
+		/*
+		 * Merged ahead of the RedBoot command line by
+		 * CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND.
+		 * - The 512 KiB default PCM preallocation does not fit the
+		 *   128 KiB IRAM (see &sdma); 64 KiB matches the legacy
+		 *   SND_RAM_SIZE.
+		 * - No text cursor: fbcon on tty1 only shows the boot logo
+		 *   (the console is the UART), and stock showed no cursor.
+		 * - ubiblock devices for both CramFS volumes: the RedBoot boot
+		 *   script passes only the stock os_cmdline ("ubi.mtd=1
+		 *   root=/dev/mtdblock:cramfs%{os_backup}"), and the initramfs
+		 *   mounts the volume named by root=.
+		 */
+		bootargs = "snd_soc_core.prealloc_buffer_size_kbytes=64 vt.global_cursor_default=0 ubi.block=0,cramfs ubi.block=0,cramfs_bak";
+		stdout-path = &uart2;
+	};
+
+	/*
+	 * Legacy panel timing (baby-video.patch) for imx-lcdc. The flags give
+	 * the polarity bits of the legacy PCR 0xfad08b80: active-low HSYNC,
+	 * VSYNC and output enable (LPPOL, FLMPOL, OEPOL set) and CLKPOL clear
+	 * (imx-lcdc maps pixelclk-active = <1> to CLKPOL = 0). imx-lcdc leaves
+	 * ACDSEL/ACD clear (0x8b00 in the legacy PCR) and LSCR at its reset
+	 * value; the picture was correct on hardware without them. Supply
+	 * topology is unknown.
+	 *
+	 * The driver (squeezebox-lcd-init.c) sends the legacy 9-bit GPIO
+	 * sequence once the LCDC is scanning and then enables the LCDC
+	 * backlight, as legacy did; earlier backlight gives a white flash.
+	 */
+	panel {
+		compatible = "logitech,squeezebox-radio-lcd";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_lcd_control>;
+		reset-gpios = <&gpio3 19 GPIO_ACTIVE_LOW>;
+		mosi-gpios = <&gpio4 11 GPIO_ACTIVE_HIGH>;
+		cs-gpios = <&gpio4 10 GPIO_ACTIVE_HIGH>;
+		clk-gpios = <&gpio1 17 GPIO_ACTIVE_HIGH>;
+		mode-mosi-gpios = <&gpio1 14 GPIO_ACTIVE_HIGH>;
+		mode-miso-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+		slcdc-cs-gpios = <&gpio1 16 GPIO_ACTIVE_HIGH>;
+		/* mxc_lcdc_bl.0, the LCDC contrast PWM */
+		backlight = <&lcdc>;
+
+		panel-timing {
+			clock-frequency = <7246377>;
+			hactive = <240>;
+			hback-porch = <20>;
+			hfront-porch = <20>;
+			hsync-len = <50>;
+			vactive = <320>;
+			vback-porch = <3>;
+			vfront-porch = <3>;
+			vsync-len = <3>;
+			hsync-active = <0>;
+			vsync-active = <0>;
+			de-active = <0>;
+			pixelclk-active = <1>;
+		};
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&lcdc_out>;
+			};
+		};
+	};
+
+	sound {
+		compatible = "logitech,squeezebox-radio-audio";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_audio_control>;
+		model = "Logitech Squeezebox Radio";
+		clocks = <&clks 129>;
+		clock-names = "mclk";
+		/*
+		 * OSC is 24 MHz; the CKO divider produces the
+		 * legacy-confirmed 12 MHz codec MCLK before this device probes.
+		 */
+		assigned-clocks = <&clks 128>, <&clks 127>;
+		assigned-clock-parents = <&clks 1>;
+		assigned-clock-rates = <0>, <12000000>;
+		cpu-dai = <&ssi1>;
+		audio-codec = <&codec>;
+		fsl,mux-int-port = <1>;
+		fsl,mux-ext-port = <6>;
+		pa-shutdown-gpios = <&gpio1 28 GPIO_ACTIVE_HIGH>;
+		pa-mute-gpios = <&gpio1 29 GPIO_ACTIVE_HIGH>;
+		linein-detect-gpios = <&gpio4 6 GPIO_ACTIVE_LOW>;
+	};
+
+	/*
+	 * Legacy baby_buttons.c: three active-low GPIO switches with a 50 ms
+	 * debounce (baby-debounce.patch raised it from 5 ms). The volume and
+	 * navigation encoders remain MSP430-owned; these are their discrete
+	 * press switches. RedBoot reports system revision 7, selecting the
+	 * GPIO_A power switch used by legacy board code for revisions >= 3.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_buttons>;
+
+		button-mute {
+			label = "Mute";
+			gpios = <&gpio4 8 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_MUTE>;
+			debounce-interval = <50>;
+		};
+
+		button-right {
+			label = "Right";
+			gpios = <&gpio4 7 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RIGHT>;
+			debounce-interval = <50>;
+		};
+
+		button-power {
+			label = "Power";
+			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_POWER>;
+			debounce-interval = <50>;
+		};
+	};
+};
+
+&iomuxc {
+	pinctrl_buttons: buttonsgrp {
+		fsl,pins = <
+			/*
+			 * baby-base.patch configured D12/D13 with Schmitt input
+			 * hysteresis and no internal pull. GPIO_A uses the legacy
+			 * 22K pull-up for the revision >= 3 power switch.
+			 */
+			MX25_PAD_D12__GPIO_4_8		0x00000100
+			MX25_PAD_D13__GPIO_4_7		0x00000100
+			MX25_PAD_GPIO_A__GPIO_1_0	0x000000f0
+		>;
+	};
+
+	pinctrl_uart2: uart2grp {
+		fsl,pins = <
+			MX25_PAD_UART2_RXD__UART2_RXD	0x80000000
+			MX25_PAD_UART2_TXD__UART2_TXD	0x80000000
+			MX25_PAD_UART2_RTS__UART2_RTS	0x80000000
+			MX25_PAD_UART2_CTS__UART2_CTS	0x80000000
+		>;
+	};
+
+	pinctrl_fec: fecgrp {
+		fsl,pins = <
+			MX25_PAD_FEC_MDC__FEC_MDC		0x000000e0
+			MX25_PAD_FEC_MDIO__FEC_MDIO		0x000001f0
+			MX25_PAD_FEC_TDATA0__FEC_TDATA0	0x000000e0
+			MX25_PAD_FEC_TDATA1__FEC_TDATA1	0x000000e0
+			MX25_PAD_FEC_TX_EN__FEC_TX_EN		0x000000e0
+			MX25_PAD_FEC_RDATA0__FEC_RDATA0	0x000001f0
+			MX25_PAD_FEC_RDATA1__FEC_RDATA1	0x000001f0
+			MX25_PAD_FEC_RX_DV__FEC_RX_DV		0x000001f0
+			MX25_PAD_FEC_TX_CLK__FEC_TX_CLK	0x000001f0
+		>;
+	};
+
+	pinctrl_lcd_rgb: lcd_rgbgrp {
+		fsl,pins = <
+			MX25_PAD_LD0__LD0		0x000000e5
+			MX25_PAD_LD1__LD1		0x000000e5
+			MX25_PAD_LD2__LD2		0x000000e5
+			MX25_PAD_LD3__LD3		0x000000e5
+			MX25_PAD_LD4__LD4		0x000000e5
+			MX25_PAD_LD5__LD5		0x000000e5
+			MX25_PAD_LD6__LD6		0x000000e5
+			MX25_PAD_LD7__LD7		0x000000e5
+			MX25_PAD_LD8__LD8		0x000000e5
+			MX25_PAD_LD9__LD9		0x000000e5
+			MX25_PAD_LD10__LD10		0x000000e5
+			MX25_PAD_LD11__LD11		0x000000e5
+			MX25_PAD_LD12__LD12		0x000000e5
+			MX25_PAD_LD13__LD13		0x000000e5
+			MX25_PAD_LD14__LD14		0x000000e5
+			MX25_PAD_LD15__LD15		0x000000e5
+			MX25_PAD_GPIO_E__LD16		0x000000e5
+			MX25_PAD_GPIO_F__LD17		0x000000e5
+			MX25_PAD_HSYNC__HSYNC		0x000000e5
+			MX25_PAD_VSYNC__VSYNC		0x000000e5
+			MX25_PAD_LSCLK__LSCLK		0x00000000
+			MX25_PAD_OE_ACD__OE_ACD	0x000000e5
+			MX25_PAD_CONTRAST__CONTRAST	0x000000e5
+		>;
+	};
+
+	pinctrl_lcd_control: lcd_controlgrp {
+		fsl,pins = <
+			MX25_PAD_D9__GPIO_4_11		0x00000002
+			MX25_PAD_D10__GPIO_4_10	0x00000002
+			MX25_PAD_CSPI1_SS1__GPIO_1_17	0x00000002
+			MX25_PAD_POWER_FAIL__GPIO_3_19	0x00000002
+			MX25_PAD_CSPI1_MOSI__GPIO_1_14	0x00000000
+			MX25_PAD_CSPI1_MISO__GPIO_1_15	0x00000000
+			MX25_PAD_CSPI1_SS0__GPIO_1_16	0x00000000
+		>;
+	};
+
+	pinctrl_lcd_backlight: lcd_backlightgrp {
+		fsl,pins = <
+			MX25_PAD_D11__GPIO_4_9		0x000000e0
+		>;
+	};
+
+	pinctrl_audio_i2c: audio-i2cgrp {
+		fsl,pins = <
+			MX25_PAD_I2C1_CLK__I2C1_CLK	0x80000000
+			MX25_PAD_I2C1_DAT__I2C1_DAT	0x80000000
+		>;
+	};
+
+	pinctrl_msp_i2c: msp-i2cgrp {
+		fsl,pins = <
+			MX25_PAD_GPIO_C__I2C2_SCL	0x1e8
+			MX25_PAD_GPIO_D__I2C2_SDA	0x1e8
+		>;
+	};
+
+	pinctrl_msp_irq: msp-irqgrp {
+		fsl,pins = <
+			MX25_PAD_UART1_RXD__GPIO_4_22	0x21d0
+		>;
+	};
+
+	pinctrl_audio_control: audio-controlgrp {
+		fsl,pins = <
+			MX25_PAD_CSI_D3__GPIO_1_28	0x000000e0
+			MX25_PAD_CSI_D4__GPIO_1_29	0x000000e0
+			MX25_PAD_D14__GPIO_4_6		0x000000e0
+		>;
+	};
+
+	pinctrl_audio_reset: audio-resetgrp {
+		fsl,pins = <
+			MX25_PAD_GPIO_B__GPIO_1_1	0x000000e0
+		>;
+	};
+
+	pinctrl_audio_ssi: audio-ssigrp {
+		fsl,pins = <
+			/*
+			 * BABY_DAC_PAD_CFG: 3.3 V, Schmitt input, no pull/keeper,
+			 * normal drive, slow slew. Read back on hardware, only
+			 * CSI_PIXCLK (frame sync) implements HYS; CSI_MCLK,
+			 * CSI_VSYNC and CSI_HSYNC (bit clock) hold bits 0xf1
+			 * only, so Schmitt has no effect there, as on legacy.
+			 */
+			MX25_PAD_CSI_MCLK__AUD6_TXD	0x00000100
+			MX25_PAD_CSI_VSYNC__AUD6_RXD	0x00000100
+			MX25_PAD_CSI_HSYNC__AUD6_TXC	0x00000100
+			MX25_PAD_CSI_PIXCLK__AUD6_TXFS	0x00000100
+			MX25_PAD_CLKO__CLKO		0x00000000
+		>;
+	};
+
+	pinctrl_kpp: kppgrp {
+		fsl,pins = <
+			/* Legacy KPP_PAD_CTL_ROW: PKE | PUE | 100K pull-up. */
+			MX25_PAD_KPP_ROW0__KPP_ROW0	0x000000e0
+			MX25_PAD_KPP_ROW1__KPP_ROW1	0x000000e0
+			MX25_PAD_KPP_ROW2__KPP_ROW2	0x000000e0
+			MX25_PAD_KPP_ROW3__KPP_ROW3	0x000000e0
+			/*
+			 * Legacy KPP_PAD_CTL_COL additionally enables
+			 * open-drain.
+			 */
+			MX25_PAD_KPP_COL0__KPP_COL0	0x000000e8
+			MX25_PAD_KPP_COL1__KPP_COL1	0x000000e8
+			MX25_PAD_KPP_COL2__KPP_COL2	0x000000e8
+			MX25_PAD_KPP_COL3__KPP_COL3	0x000000e8
+		>;
+	};
+};
+
+&uart2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_uart2>;
+	status = "okay";
+};
+
+&fec {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_fec>;
+	phy-mode = "rmii";
+	phy-handle = <&ethphy>;
+	status = "okay";
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ethphy: ethernet-phy@1 {
+			reg = <1>;
+		};
+	};
+};
+
+/*
+ * The live NAND probe confirms the i.MX25 NFC exposes a Samsung 128 MiB,
+ * 8-bit SLC part with 128 KiB eraseblocks, 2 KiB pages, and 64-byte OOB.
+ * Legacy board code provides the two partition ranges and enables hardware
+ * ECC. The final six eraseblocks remain unassigned: the legacy UBI attach
+ * range ends at 0x07f40000, so describing the full device would invent a use
+ * for that tail.
+ */
+&nfc {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	/*
+	 * `nand-on-flash-bbt` is intentionally absent: legacy source does not
+	 * establish an on-flash BBT, and creating one would write the NAND.
+	 */
+	nand-bus-width = <8>;
+	nand-ecc-mode = "hw";
+	status = "okay";
+
+	/* RedBoot itself: never written from Linux. */
+	partition@0 {
+		label = "redboot";
+		reg = <0x00000000 0x00080000>;
+		read-only;
+	};
+
+	/*
+	 * SqueezeOS UBI: stock kernels, CramFS root and the "ubifs" settings
+	 * volume. Writable so the settings volume can be mounted read-write
+	 * like on stock firmware; only UBIFS and UBI housekeeping write here.
+	 */
+	partition@80000 {
+		label = "ubi";
+		reg = <0x00080000 0x07ec0000>;
+	};
+};
+
+/*
+ * Codec probing retains the legacy reset line.  The machine driver owns PA
+ * power only after it establishes the codec, SSI, and AUDMUX card.
+ */
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_audio_i2c>;
+	status = "okay";
+
+	codec: codec@18 {
+		compatible = "ti,tlv320aic3x";
+		reg = <0x18>;
+		reset-gpios = <&gpio1 1 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_audio_reset>;
+		/* Legacy codec register 40 selected a 1.65 V output bias. */
+		ai3x-ocmv = <2>;
+	};
+};
+
+/*
+ * The MSP430 is the source of the rotary/volume encoder, IR, RTC, and
+ * battery/charger telemetry.  The interrupt is open-collector: idle high,
+ * asserted low.
+ */
+&i2c2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_msp_i2c &pinctrl_msp_irq>;
+	clock-frequency = <100000>;
+	status = "okay";
+
+	msp430: msp430@10 {
+		compatible = "logitech,squeezebox-radio-msp430";
+		reg = <0x10>;
+		interrupt-parent = <&gpio4>;
+		interrupts = <22 IRQ_TYPE_LEVEL_LOW>;
+		/* Legacy power-off writes 0xde to MSP430 register 99. */
+		system-power-controller;
+	};
+};
+
+&audmux {
+	status = "okay";
+};
+
+&ssi1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_audio_ssi>;
+	status = "okay";
+};
+
+/*
+ * Legacy audio kept the PCM buffer and SDMA descriptors in on-chip IRAM
+ * (CONFIG_SND_MXC_SOC_IRAM, CONFIG_SDMA_IRAM). imx-sdma allocates its
+ * descriptors there and feeds the SSI from IRAM with the per_2_shp script;
+ * the generic dmaengine PCM places the buffer in this pool when its
+ * preallocation fits (64 KiB, set through /chosen/bootargs).
+ */
+&sdma {
+	iram = <&iram>;
+};
+
+/*
+ * The legacy 4x4 KPP matrix supplies the front-panel buttons.  Keep its
+ * row-major map exactly: two physically absent positions remain unmapped.
+ */
+&kpp {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_kpp>;
+	linux,keymap = <
+		MATRIX_KEY(0, 0, KEY_PLAY)
+		MATRIX_KEY(0, 1, KEY_KPPLUS)
+		MATRIX_KEY(0, 2, KEY_LEFT)
+		MATRIX_KEY(0, 3, KEY_HOME)
+		MATRIX_KEY(1, 0, KEY_F1)
+		MATRIX_KEY(1, 1, KEY_PLAYPAUSE)
+		MATRIX_KEY(1, 2, KEY_NEXTSONG)
+		MATRIX_KEY(1, 3, KEY_PREVIOUSSONG)
+		MATRIX_KEY(2, 0, KEY_F5)
+		MATRIX_KEY(2, 1, KEY_F4)
+		MATRIX_KEY(2, 2, KEY_F3)
+		MATRIX_KEY(2, 3, KEY_F2)
+		MATRIX_KEY(3, 2, KEY_SLEEP)
+		MATRIX_KEY(3, 3, KEY_F6)
+	>;
+	status = "okay";
+};
+
+/*
+ * imx-lcdc DRM driver; its fbdev emulation provides /dev/fb0 (RGB565) for
+ * SqueezePlay. imx25-squeezebox-radio-fbdev.dts binds the legacy imxfb.
+ */
+&lcdc {
+	compatible = "fsl,imx25-lcdc", "fsl,imx21-lcdc";
+	/*
+	 * 0x00a903ff is the upstream i.MX25 LCDC contrast configuration;
+	 * the low byte is the legacy mxc_lcdc_bl default intensity (127).
+	 */
+	fsl,lpccr = <0x00a9037f>;
+	/* Legacy D11: 0 = normal, 1 = extra-low brightness (bl_power != 0). */
+	backlight-low-power-gpios = <&gpio4 9 GPIO_ACTIVE_HIGH>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_lcd_rgb>, <&pinctrl_lcd_backlight>;
+	status = "okay";
+
+	port {
+		lcdc_out: endpoint {
+			remote-endpoint = <&panel_in>;
+		};
+	};
+};
+
+/*
+ * Legacy kernels had no DryIce driver, and the unit reports "Failure+Invalid
+ * state" on this board. Keep it disabled so the MSP430 is the only RTC.
+ */
+&{/soc/bus@53f00000/dryice@53ffc000} {
+	status = "disabled";
+};

@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Logitech Squeezebox Radio with the legacy imxfb framebuffer driver in place
+ * of imx-lcdc DRM. Everything else is the base board description.
+ */
+
+#include "imx25-squeezebox-radio.dts"
+
+/ {
+	/delete-node/ panel;
+
+	/* Sends the panel sequence once at probe; imxfb lights the backlight. */
+	panel-init {
+		compatible = "logitech,squeezebox-radio-panel-init";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_lcd_control>;
+		reset-gpios = <&gpio3 19 GPIO_ACTIVE_LOW>;
+		mosi-gpios = <&gpio4 11 GPIO_ACTIVE_HIGH>;
+		cs-gpios = <&gpio4 10 GPIO_ACTIVE_HIGH>;
+		clk-gpios = <&gpio1 17 GPIO_ACTIVE_HIGH>;
+		mode-mosi-gpios = <&gpio1 14 GPIO_ACTIVE_HIGH>;
+		mode-miso-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+		slcdc-cs-gpios = <&gpio1 16 GPIO_ACTIVE_HIGH>;
+	};
+
+	display0: display {
+		model = "Logitech Squeezebox Radio legacy LCD";
+		bits-per-pixel = <16>;
+		/*
+		 * Exact legacy mx2fb base PCR (0xfa008b80) plus this panel's
+		 * OE-low and inverted HSYNC/VSYNC flags. imxfb supplies BPIX
+		 * and PCD from bits-per-pixel and display-timings.
+		 */
+		fsl,pcr = <0xfad08b80>;
+
+		display-timings {
+			native-mode = <&timing0>;
+
+			/* Same mode as the base panel-timing node. */
+			timing0: timing0 {
+				clock-frequency = <7246377>;
+				hactive = <240>;
+				hback-porch = <20>;
+				hfront-porch = <20>;
+				hsync-len = <50>;
+				vactive = <320>;
+				vback-porch = <3>;
+				vfront-porch = <3>;
+				vsync-len = <3>;
+			};
+		};
+	};
+};
+
+&lcdc {
+	compatible = "fsl,imx25-fb", "fsl,imx21-fb";
+	display = <&display0>;
+	/delete-node/ port;
+};

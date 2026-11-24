@@ -8,7 +8,9 @@ dtb-$(CONFIG_SOC_IMX25) += \
 	imx25-eukrea-mbimxsd25-baseboard-dvi-svga.dtb \
 	imx25-eukrea-mbimxsd25-baseboard-dvi-vga.dtb \
 	imx25-karo-tx25.dtb \
-	imx25-pdk.dtb
+	imx25-pdk.dtb \
+	imx25-squeezebox-radio.dtb \
+	imx25-squeezebox-radio-fbdev.dtb
 dtb-$(CONFIG_SOC_IMX27) += \
 	imx27-apf27.dtb \
 	imx27-apf27dev.dtb \
