@@ -155,6 +155,29 @@ config FB_IMX
 	select FB_MODE_HELPERS
 	select VIDEOMODE_HELPERS
 
+config FB_IMX_BACKLIGHT
+	bool "i.MX LCDC contrast PWM as backlight (legacy mxc_lcdc_bl ABI)"
+	depends on FB_IMX && (BACKLIGHT_CLASS_DEVICE=y || BACKLIGHT_CLASS_DEVICE=FB_IMX)
+	help
+	  Register the LCDC contrast PWM configured by fsl,lpccr as the
+	  backlight device "mxc_lcdc_bl.0", with the brightness and bl_power
+	  semantics of the Freescale 2.6 mxc_lcdc_bl driver used by the
+	  Logitech Squeezebox Radio's SqueezePlay. An optional
+	  backlight-low-power GPIO is asserted while bl_power is non-zero.
+
+config FB_SQUEEZEBOX_LCD_INIT
+	bool "Logitech Squeezebox Radio legacy panel initializer"
+	depends on (FB_IMX=y || DRM_IMX_LCDC=y) && GPIOLIB && OF
+	depends on DRM=y || DRM=n
+	select VIDEOMODE_HELPERS
+	help
+	  Apply the active legacy 9-bit GPIO panel initialization sequence for
+	  the Logitech Squeezebox Radio: once at probe for imxfb
+	  ("panel-init" node), or as a DRM panel for imx-lcdc that initializes
+	  the panel after the LCDC started and then enables the backlight.
+	  The backlight is controlled by FB_IMX_BACKLIGHT or
+	  DRM_IMX_LCDC_BACKLIGHT.
+
 config FB_CYBER2000
 	tristate "CyberPro 2000/2010/5000 support"
 	depends on FB && PCI && HAS_IOPORT && (BROKEN || !SPARC64)

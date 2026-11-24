@@ -12,6 +12,8 @@
  */
 
 #include <linux/module.h>
+#include <linux/backlight.h>
+#include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -190,6 +192,9 @@ struct imxfb_info {
 
 	struct regulator	*lcd_pwr;
 	int			lcd_pwr_enabled;
+
+	struct backlight_device	*bl;
+	struct gpio_desc	*bl_low_power;
 };
 
 static const struct platform_device_id imxfb_devtype[] = {
@@ -544,6 +549,11 @@ static int imxfb_enable_controller(struct imxfb_info *fbi)
 		goto err_enable_per;
 
 	fbi->enabled = true;
+
+	/* Apply backlight changes made while the controller was off. */
+	if (fbi->bl)
+		writel(fbi->pwmr, fbi->regs + LCDC_PWMR);
+
 	return 0;
 
 err_enable_per:
@@ -853,6 +863,81 @@ static const struct lcd_ops imxfb_lcd_ops = {
 	.set_power	= imxfb_lcd_set_power,
 };
 
+#if IS_ENABLED(CONFIG_FB_IMX_BACKLIGHT)
+/*
+ * Freescale 2.6 mxc_lcdc_bl semantics, as used by SqueezePlay: brightness is
+ * the LPCCR pulse width; bl_power 4 turns the backlight off, and any non-zero
+ * bl_power drives the panel's low-current (dim) GPIO.
+ */
+static int imxfb_bl_update_status(struct backlight_device *bl)
+{
+	struct imxfb_info *fbi = bl_get_data(bl);
+	int level = bl->props.brightness;
+
+	if (bl->props.power == BACKLIGHT_POWER_OFF)
+		level = 0;
+
+	fbi->pwmr = (fbi->pwmr & ~0xff) | level;
+	if (fbi->enabled)
+		writel(fbi->pwmr, fbi->regs + LCDC_PWMR);
+
+	gpiod_set_value_cansleep(fbi->bl_low_power,
+				 bl->props.power != BACKLIGHT_POWER_ON);
+
+	return 0;
+}
+
+static int imxfb_bl_get_brightness(struct backlight_device *bl)
+{
+	struct imxfb_info *fbi = bl_get_data(bl);
+
+	return fbi->pwmr & 0xff;
+}
+
+static const struct backlight_ops imxfb_bl_ops = {
+	.update_status	= imxfb_bl_update_status,
+	.get_brightness	= imxfb_bl_get_brightness,
+};
+
+static int imxfb_init_backlight(struct imxfb_info *fbi)
+{
+	struct device *dev = &fbi->pdev->dev;
+	struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		.max_brightness = 0xff,
+		.brightness = fbi->pwmr & 0xff,
+		.power = BACKLIGHT_POWER_ON,
+	};
+
+	/* Only boards that configure the contrast PWM use it as backlight. */
+	if (!fbi->pwmr)
+		return 0;
+
+	fbi->bl_low_power = devm_gpiod_get_optional(dev, "backlight-low-power",
+						    GPIOD_OUT_LOW);
+	if (IS_ERR(fbi->bl_low_power))
+		return dev_err_probe(dev, PTR_ERR(fbi->bl_low_power),
+				     "backlight low-power GPIO\n");
+
+	/* SqueezePlay opens /sys/class/backlight/mxc_lcdc_bl.0. */
+	fbi->bl = devm_backlight_device_register(dev, "mxc_lcdc_bl.0", dev, fbi,
+						 &imxfb_bl_ops, &props);
+	if (IS_ERR(fbi->bl)) {
+		int ret = PTR_ERR(fbi->bl);
+
+		fbi->bl = NULL;
+		return dev_err_probe(dev, ret, "failed to register backlight\n");
+	}
+
+	return 0;
+}
+#else
+static int imxfb_init_backlight(struct imxfb_info *fbi)
+{
+	return 0;
+}
+#endif
+
 static int imxfb_setup(void)
 {
 	char *opt, *options = NULL;
@@ -1032,6 +1117,10 @@ static int imxfb_probe(struct platform_device *pdev)
 	lcd->props.max_contrast = 0xff;
 
 	info->lcd_dev = lcd;
+
+	ret = imxfb_init_backlight(fbi);
+	if (ret)
+		goto failed_lcd;
 
 	ret = register_framebuffer(info);
 	if (ret < 0) {
