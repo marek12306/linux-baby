@@ -3881,12 +3881,17 @@ int ath6kl_cfg80211_init(struct ath6kl *ar)
 	/* set device pointer for wiphy */
 	set_wiphy_dev(wiphy, ar->dev);
 
-	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
-				 BIT(NL80211_IFTYPE_ADHOC) |
-				 BIT(NL80211_IFTYPE_AP);
-	if (ar->p2p) {
-		wiphy->interface_modes |= BIT(NL80211_IFTYPE_P2P_GO) |
-					  BIT(NL80211_IFTYPE_P2P_CLIENT);
+	if (ar->hw.flags & ATH6KL_HW_LEGACY_WMI) {
+		/* the host side of the WMI 2.x ABI is implemented for STA */
+		wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	} else {
+		wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
+					 BIT(NL80211_IFTYPE_ADHOC) |
+					 BIT(NL80211_IFTYPE_AP);
+		if (ar->p2p) {
+			wiphy->interface_modes |= BIT(NL80211_IFTYPE_P2P_GO) |
+						  BIT(NL80211_IFTYPE_P2P_CLIENT);
+		}
 	}
 
 	if (IS_ENABLED(CONFIG_ATH6KL_REGDOMAIN) &&
@@ -3896,7 +3901,10 @@ int ath6kl_cfg80211_init(struct ath6kl *ar)
 	}
 
 	/* max num of ssids that can be probed during scanning */
-	wiphy->max_scan_ssids = MAX_PROBED_SSIDS;
+	if (ar->hw.flags & ATH6KL_HW_LEGACY_WMI)
+		wiphy->max_scan_ssids = WMI_LEGACY_MAX_PROBED_SSIDS;
+	else
+		wiphy->max_scan_ssids = MAX_PROBED_SSIDS;
 
 	/* max num of ssids that can be matched after scan */
 	if (test_bit(ATH6KL_FW_CAPABILITY_SCHED_SCAN_MATCH_LIST,
@@ -3980,10 +3988,11 @@ int ath6kl_cfg80211_init(struct ath6kl *ar)
 
 	wiphy->max_sched_scan_ssids = MAX_PROBED_SSIDS;
 
-	ar->wiphy->flags |= WIPHY_FLAG_SUPPORTS_FW_ROAM |
-			    WIPHY_FLAG_HAVE_AP_SME |
-			    WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL |
-			    WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
+	ar->wiphy->flags |= WIPHY_FLAG_SUPPORTS_FW_ROAM;
+	if (!(ar->hw.flags & ATH6KL_HW_LEGACY_WMI))
+		ar->wiphy->flags |= WIPHY_FLAG_HAVE_AP_SME |
+				    WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL |
+				    WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
 
 	if (test_bit(ATH6KL_FW_CAPABILITY_SCHED_SCAN_V2, ar->fw_capabilities))
 		ar->wiphy->max_sched_scan_reqs = 1;

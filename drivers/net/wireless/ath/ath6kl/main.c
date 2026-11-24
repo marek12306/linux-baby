@@ -1167,6 +1167,13 @@ static void ath6kl_set_multicast_list(struct net_device *ndev)
 	    !test_bit(WLAN_ENABLED, &vif->flags))
 		return;
 
+	/*
+	 * WMI 2.x has no such commands at these ids (the vendor driver never
+	 * sets multicast filters); leave the firmware default.
+	 */
+	if (vif->ar->hw.flags & ATH6KL_HW_LEGACY_WMI)
+		return;
+
 	/* Enable multicast-all filter. */
 	mc_all_on = !!(ndev->flags & IFF_PROMISC) ||
 		    !!(ndev->flags & IFF_ALLMULTI) ||

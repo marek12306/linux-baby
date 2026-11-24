@@ -344,6 +344,14 @@ static inline u8 wmi_cmd_hdr_get_if_idx(struct wmi_cmd_hdr *chdr)
 	return le16_to_cpu(chdr->info1) & WMI_CMD_HDR_IF_ID_MASK;
 }
 
+/*
+ * WMI 2.x (AR6002 firmware, ATH6KL_HW_LEGACY_WMI): the data header is only
+ * rssi and info, the command/event header only the command id. There is a
+ * single interface (index 0) and no metadata.
+ */
+#define WMI_LEGACY_DATA_HDR_LEN	2
+#define WMI_LEGACY_CMD_HDR_LEN	2
+
 /* List of WMI commands */
 enum wmi_cmd_id {
 	WMI_CONNECT_CMDID = 0x0001,
@@ -733,6 +741,9 @@ enum wmi_connect_ctrl_flags_bits {
 	CONNECT_WPS_FLAG = 0x0100,
 };
 
+/* WMI 2.x defines bits up to CONNECT_CSA_FOLLOW_BSS; 0x40 differs there */
+#define WMI_LEGACY_CONNECT_CTRL_FLAGS	0x003f
+
 struct wmi_connect_cmd {
 	u8 nw_type;
 	u8 dot11_auth_mode;
@@ -1005,6 +1016,8 @@ struct wmi_bss_filter_cmd {
 
 /* WMI_SET_PROBED_SSID_CMDID */
 #define MAX_PROBED_SSIDS   16
+/* WMI 2.x firmware accepts probed SSID entries 0..5 */
+#define WMI_LEGACY_MAX_PROBED_SSIDS	6
 
 enum wmi_ssid_flag {
 	/* disables entry */
@@ -1507,6 +1520,13 @@ struct wmi_ready_event_2 {
 	u8 phy_cap;
 } __packed;
 
+/* WMI 2.x ready event: no ABI version */
+struct wmi_ready_event_legacy {
+	__le32 sw_version;
+	u8 mac_addr[ETH_ALEN];
+	u8 phy_cap;
+} __packed;
+
 /* WMI_PHY_CAPABILITY */
 enum wmi_phy_cap {
 	WMI_11A_CAP = 0x01,
@@ -1667,6 +1687,16 @@ struct wmi_bss_info_hdr2 {
 	u8 snr; /* note: rssi = snr - 95 dBm */
 	u8 bssid[ETH_ALEN];
 	__le16 ie_mask;
+} __packed;
+
+/* WMI 2.x BSS info header */
+struct wmi_bss_info_hdr_legacy {
+	__le16 ch; /* frequency in MHz */
+	u8 frame_type;
+	u8 snr;
+	a_sle16 rssi;
+	u8 bssid[ETH_ALEN];
+	__le32 ie_mask;
 } __packed;
 
 /* Command Error Event */
@@ -1845,6 +1875,20 @@ struct wmi_target_stats {
 	struct wlan_wow_stats wow_stats;
 	struct arp_stats arp_stats;
 	struct cserv_stats cserv_stats;
+} __packed;
+
+/*
+ * WMI 2.x statistics: pm_stats is only pwr_save_failure_cnt. The 2.1
+ * firmware sends no arp_stats; the vendor driver accepts both forms.
+ */
+struct wmi_target_stats_legacy {
+	__le32 lq_val;
+	a_sle32 noise_floor_calib;
+	__le32 pwr_save_failure_cnt;
+	struct wlan_net_stats stats;
+	struct wlan_wow_stats wow_stats;
+	/* struct arp_stats (optional), struct cserv_stats */
+	u8 tail[];
 } __packed;
 
 /*

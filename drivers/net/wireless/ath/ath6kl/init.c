@@ -34,6 +34,29 @@
 
 static const struct ath6kl_hw hw_list[] = {
 	{
+		.id				= AR6002_HW_2_0_VERSION,
+		.name				= "ar6002 hw 2.0",
+		/*
+		 * Load addresses of the 2.1.2 athwlan.bin and
+		 * data.patch.hw2_0.bin shipped for this ROM (Logitech
+		 * Squeezebox Radio loader); later SDK builds link elsewhere.
+		 * The firmware starts at the ROM default application
+		 * address: the vendor loader sends no BMI_SET_APP_START.
+		 */
+		.dataset_patch_addr		= 0x52d8bc,
+		.app_load_addr			= 0x502400,
+		.refclk_hz			= 26000000,
+		.flags				= ATH6KL_HW_LEGACY_WMI,
+
+		.fw = {
+			.dir		= AR6002_HW_2_0_FW_DIR,
+			.fw		= AR6002_HW_2_0_FIRMWARE_FILE,
+			.patch		= AR6002_HW_2_0_PATCH_FILE,
+		},
+
+		.fw_board		= AR6002_HW_2_0_BOARD_DATA_FILE,
+	},
+	{
 		.id				= AR6003_HW_2_0_VERSION,
 		.name				= "ar6003 hw 2.0",
 		.dataset_patch_addr		= 0x57e884,
@@ -456,13 +479,18 @@ static int ath6kl_target_config_wlan_params(struct ath6kl *ar, int idx)
 	/*
 	 * Configure the device for rx dot11 header rules. "0,0" are the
 	 * default values. Required if checksum offload is needed. Set
-	 * RxMetaVersion to 2.
+	 * RxMetaVersion to 2. The WMI 2.x firmware has no such command and
+	 * always uses these defaults.
 	 */
-	ret = ath6kl_wmi_set_rx_frame_format_cmd(ar->wmi, idx,
-						 ar->rx_meta_ver, 0, 0);
-	if (ret) {
-		ath6kl_err("unable to set the rx frame format: %d\n", ret);
-		return ret;
+	if (!(ar->hw.flags & ATH6KL_HW_LEGACY_WMI)) {
+		ret = ath6kl_wmi_set_rx_frame_format_cmd(ar->wmi, idx,
+							 ar->rx_meta_ver,
+							 0, 0);
+		if (ret) {
+			ath6kl_err("unable to set the rx frame format: %d\n",
+				   ret);
+			return ret;
+		}
 	}
 
 	if (ar->conf_flags & ATH6KL_CONF_IGNORE_PS_FAIL_EVT_IN_SCAN) {
@@ -599,12 +627,19 @@ int ath6kl_configure_target(struct ath6kl *ar)
 		return -EIO;
 	}
 
-	param |= (ar->vif_max << HI_OPTION_NUM_DEV_SHIFT);
-	param |= fw_mode << HI_OPTION_FW_MODE_SHIFT;
-	param |= fw_submode << HI_OPTION_FW_SUBMODE_SHIFT;
+	if (ar->target_type == TARGET_TYPE_AR6002) {
+		/* As the vendor driver and loader: STA mode, timer WAR */
+		param |= HI_OPTION_FW_MODE_BSS_STA <<
+			 AR6002_HI_OPTION_FW_MODE_SHIFT;
+		param |= HI_OPTION_TIMER_WAR;
+	} else {
+		param |= (ar->vif_max << HI_OPTION_NUM_DEV_SHIFT);
+		param |= fw_mode << HI_OPTION_FW_MODE_SHIFT;
+		param |= fw_submode << HI_OPTION_FW_SUBMODE_SHIFT;
 
-	param |= (0 << HI_OPTION_MAC_ADDR_METHOD_SHIFT);
-	param |= (0 << HI_OPTION_FW_BRIDGE_SHIFT);
+		param |= (0 << HI_OPTION_MAC_ADDR_METHOD_SHIFT);
+		param |= (0 << HI_OPTION_FW_BRIDGE_SHIFT);
+	}
 
 	if (ath6kl_bmi_write_hi32(ar, hi_option_flag, param) != 0) {
 		ath6kl_err("bmi_write_memory for setting fwmode failed\n");
@@ -645,11 +680,13 @@ int ath6kl_configure_target(struct ath6kl *ar)
 		/* use default number of control buffers */
 		return -EIO;
 
-	/* Configure GPIO AR600x UART */
-	status = ath6kl_bmi_write_hi32(ar, hi_dbg_uart_txpin,
-				       ar->hw.uarttx_pin);
-	if (status)
-		return status;
+	/* Configure GPIO AR600x UART; AR6002 has no such host interest item */
+	if (ar->target_type != TARGET_TYPE_AR6002) {
+		status = ath6kl_bmi_write_hi32(ar, hi_dbg_uart_txpin,
+					       ar->hw.uarttx_pin);
+		if (status)
+			return status;
+	}
 
 	/* Only set the baud rate if we're actually doing debug */
 	if (ar->conf_flags & ATH6KL_CONF_UART_DEBUG) {
@@ -762,6 +799,11 @@ static int ath6kl_fetch_board_file(struct ath6kl *ar)
 	}
 
 	/* there was no proper board file, try to use default instead */
+	if (!ar->hw.fw_default_board) {
+		ath6kl_err("Failed to get board file %s: %d\n", filename, ret);
+		return ret;
+	}
+
 	ath6kl_warn("Failed to get board file %s (%d), trying to find default board file.\n",
 		    filename, ret);
 
@@ -1224,11 +1266,18 @@ static int ath6kl_upload_board_file(struct ath6kl *ar)
 		}
 	}
 
-	/* determine where in target ram to write extended board data */
-	ret = ath6kl_bmi_read_hi32(ar, hi_board_ext_data, &board_ext_address);
-	if (ret) {
-		ath6kl_err("Failed to get extended board file target address.\n");
-		return ret;
+	/*
+	 * Determine where in target ram to write extended board data.
+	 * AR6002 has neither extended board data nor this host interest item.
+	 */
+	board_ext_address = 0;
+	if (ar->target_type != TARGET_TYPE_AR6002) {
+		ret = ath6kl_bmi_read_hi32(ar, hi_board_ext_data,
+					   &board_ext_address);
+		if (ret) {
+			ath6kl_err("Failed to get extended board file target address.\n");
+			return ret;
+		}
 	}
 
 	if (ar->target_type == TARGET_TYPE_AR6003 &&
@@ -1238,6 +1287,10 @@ static int ath6kl_upload_board_file(struct ath6kl *ar)
 	}
 
 	switch (ar->target_type) {
+	case TARGET_TYPE_AR6002:
+		board_data_size = AR6002_BOARD_DATA_SZ;
+		board_ext_data_size = 0;
+		break;
 	case TARGET_TYPE_AR6003:
 		board_data_size = AR6003_BOARD_DATA_SZ;
 		board_ext_data_size = AR6003_BOARD_EXT_DATA_SZ;
@@ -1364,7 +1417,15 @@ static int ath6kl_upload_firmware(struct ath6kl *ar)
 	ath6kl_dbg(ATH6KL_DBG_BOOT, "writing firmware to 0x%x (%zd B)\n",
 		   address, ar->fw_len);
 
-	ret = ath6kl_bmi_fast_download(ar, address, ar->fw, ar->fw_len);
+	/*
+	 * The AR6002 image is not LZ77-compressed; write it with plain
+	 * BMI_WRITE_MEMORY, as the vendor loader does.
+	 */
+	if (ar->target_type == TARGET_TYPE_AR6002)
+		ret = ath6kl_bmi_write(ar, address, ar->fw, ar->fw_len);
+	else
+		ret = ath6kl_bmi_fast_download(ar, address, ar->fw,
+					       ar->fw_len);
 
 	if (ret) {
 		ath6kl_err("Failed to write firmware: %d\n", ret);
@@ -1373,9 +1434,10 @@ static int ath6kl_upload_firmware(struct ath6kl *ar)
 
 	/*
 	 * Set starting address for firmware
-	 * Don't need to setup app_start override addr on AR6004
+	 * Don't need to setup app_start override addr on AR6004; AR6002
+	 * starts at the ROM default
 	 */
-	if (ar->target_type != TARGET_TYPE_AR6004) {
+	if (ar->target_type == TARGET_TYPE_AR6003) {
 		address = ar->hw.app_start_override_addr;
 		ath6kl_bmi_set_app_start(ar, address);
 	}
@@ -1445,7 +1507,8 @@ static int ath6kl_init_upload(struct ath6kl *ar)
 	u32 param, options, sleep, address;
 	int status = 0;
 
-	if (ar->target_type != TARGET_TYPE_AR6003 &&
+	if (ar->target_type != TARGET_TYPE_AR6002 &&
+	    ar->target_type != TARGET_TYPE_AR6003 &&
 	    ar->target_type != TARGET_TYPE_AR6004)
 		return -EINVAL;
 
@@ -1477,9 +1540,16 @@ static int ath6kl_init_upload(struct ath6kl *ar)
 	ath6kl_dbg(ATH6KL_DBG_TRC, "old options: %d, old sleep: %d\n",
 		   options, sleep);
 
-	/* program analog PLL register */
-	/* no need to control 40/44MHz clock on AR6004 */
-	if (ar->target_type != TARGET_TYPE_AR6004) {
+	if (ar->target_type == TARGET_TYPE_AR6002) {
+		/* Vendor loader: 40/44 MHz, no analog PLL setup */
+		address = RTC_BASE_ADDRESS + CPU_CLOCK_ADDRESS;
+		status = ath6kl_bmi_reg_write(ar, address,
+					      SM(CPU_CLOCK_STANDARD, 0));
+		if (status)
+			return status;
+	} else if (ar->target_type != TARGET_TYPE_AR6004) {
+		/* program analog PLL register */
+		/* no need to control 40/44MHz clock on AR6004 */
 		status = ath6kl_bmi_reg_write(ar, ATH6KL_ANALOG_PLL_REGISTER,
 					      0xF9104001);
 
@@ -1495,12 +1565,24 @@ static int ath6kl_init_upload(struct ath6kl *ar)
 			return status;
 	}
 
+	/*
+	 * AR6002 (vendor loader): calibrate the LPO only when the ROM found
+	 * no external sleep clock.
+	 */
 	param = 0;
-	address = RTC_BASE_ADDRESS + LPO_CAL_ADDRESS;
-	param = SM(LPO_CAL_ENABLE, 1);
-	status = ath6kl_bmi_reg_write(ar, address, param);
-	if (status)
-		return status;
+	if (ar->target_type == TARGET_TYPE_AR6002) {
+		status = ath6kl_bmi_read_hi32(ar, hi_ext_clk_detected, &param);
+		if (status)
+			return status;
+	}
+
+	if (!param) {
+		address = RTC_BASE_ADDRESS + LPO_CAL_ADDRESS;
+		param = SM(LPO_CAL_ENABLE, 1);
+		status = ath6kl_bmi_reg_write(ar, address, param);
+		if (status)
+			return status;
+	}
 
 	/* WAR to avoid SDIO CRC err */
 	if (ar->hw.flags & ATH6KL_HW_SDIO_CRC_ERROR_WAR) {
@@ -1565,8 +1647,11 @@ static int ath6kl_init_upload(struct ath6kl *ar)
 	if (status)
 		return status;
 
+	/* AR6002: restore the saved options, as the vendor loader does */
 	address = MBOX_BASE_ADDRESS + LOCAL_SCRATCH_ADDRESS;
-	param = options | 0x20;
+	param = options;
+	if (ar->target_type != TARGET_TYPE_AR6002)
+		param |= 0x20;
 	status = ath6kl_bmi_reg_write(ar, address, param);
 	if (status)
 		return status;
@@ -1794,7 +1879,9 @@ static int __ath6kl_init_hw_start(struct ath6kl *ar)
 		ath6kl_info("firmware supports: %s\n", buf);
 	}
 
-	if (ar->version.abi_ver != ATH6KL_ABI_VERSION) {
+	/* The WMI 2.x ready event carries no ABI version */
+	if (!(ar->hw.flags & ATH6KL_HW_LEGACY_WMI) &&
+	    ar->version.abi_ver != ATH6KL_ABI_VERSION) {
 		ath6kl_err("abi version mismatch: host(0x%x), target(0x%x)\n",
 			   ATH6KL_ABI_VERSION, ar->version.abi_ver);
 		ret = -EIO;

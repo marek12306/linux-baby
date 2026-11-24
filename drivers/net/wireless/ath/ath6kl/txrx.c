@@ -743,7 +743,10 @@ void ath6kl_tx_complete(struct htc_target *target,
 				wake_event = true;
 		}
 
-		if (eid == ar->ctrl_ep) {
+		if (ar->hw.flags & ATH6KL_HW_LEGACY_WMI) {
+			/* WMI 2.x headers carry no interface index */
+			if_idx = 0;
+		} else if (eid == ar->ctrl_ep) {
 			if_idx = wmi_cmd_hdr_get_if_idx(
 				(struct wmi_cmd_hdr *) packet->buf);
 		} else {
@@ -1344,6 +1347,24 @@ void ath6kl_rx(struct htc_target *target, struct htc_packet *packet)
 		if_idx =
 		wmi_cmd_hdr_get_if_idx((struct wmi_cmd_hdr *) skb->data);
 	} else {
+		/*
+		 * The WMI 2.x data header is only rssi and info; expand it to
+		 * the current layout, all other fields zero (interface 0, no
+		 * metadata, 802.3 frame, not A-MSDU).
+		 */
+		if (ar->hw.flags & ATH6KL_HW_LEGACY_WMI) {
+			int grow = sizeof(struct wmi_data_hdr) -
+				   WMI_LEGACY_DATA_HDR_LEN;
+
+			if (skb->len < WMI_LEGACY_DATA_HDR_LEN) {
+				dev_kfree_skb(skb);
+				return;
+			}
+			skb_push(skb, grow);
+			memmove(skb->data, skb->data + grow,
+				WMI_LEGACY_DATA_HDR_LEN);
+			memset(skb->data + WMI_LEGACY_DATA_HDR_LEN, 0, grow);
+		}
 		if_idx =
 		wmi_data_hdr_get_if_idx((struct wmi_data_hdr *) skb->data);
 	}
@@ -1387,8 +1408,8 @@ void ath6kl_rx(struct htc_target *target, struct htc_packet *packet)
 	 * Allow these frames in the AP mode.
 	 */
 	if (vif->nw_type != AP_NETWORK &&
-	    ((packet->act_len < min_hdr_len) ||
-	     (packet->act_len > WMI_MAX_AMSDU_RX_DATA_FRAME_LENGTH))) {
+	    ((skb->len < min_hdr_len) ||
+	     (skb->len > WMI_MAX_AMSDU_RX_DATA_FRAME_LENGTH))) {
 		ath6kl_info("frame len is too short or too long\n");
 		vif->ndev->stats.rx_errors++;
 		vif->ndev->stats.rx_length_errors++;

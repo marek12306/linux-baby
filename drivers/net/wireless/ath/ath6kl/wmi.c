@@ -133,6 +133,64 @@ enum htc_endpoint_id ath6kl_wmi_get_control_ep(struct wmi *wmi)
 	return wmi->ep_id;
 }
 
+static bool ath6kl_wmi_legacy(struct wmi *wmi)
+{
+	return wmi->parent_dev->hw.flags & ATH6KL_HW_LEGACY_WMI;
+}
+
+/*
+ * Command ids that name the same command in WMI 2.x (AR6kSDK 2.2 wmi.h);
+ * above 0xf013 the numbering differs, and 0xf009/0xf00a are vendor commands.
+ */
+static bool ath6kl_wmi_legacy_cmd(enum wmi_cmd_id id)
+{
+	return (id >= WMI_CONNECT_CMDID && id <= WMI_SET_FRAMERATES_CMDID) ||
+	       (id >= WMI_SET_BITRATE_CMDID &&
+		id <= WMI_SET_TARGET_EVENT_REPORT_CMDID) ||
+	       (id >= WMI_AP_HIDDEN_SSID_CMDID &&
+		id <= WMI_AP_PROT_SCAN_TIME_CMDID) ||
+	       id == WMI_AP_SET_DTIM_CMDID;
+}
+
+/* WMI 2.x numbers the auth and crypto modes sequentially, not as bits */
+static int ath6kl_wmi_legacy_auth(enum auth_mode auth)
+{
+	switch (auth) {
+	case NONE_AUTH:
+		return 0x01;
+	case WPA_AUTH:
+		return 0x02;
+	case WPA_PSK_AUTH:
+		return 0x03;
+	case WPA2_AUTH:
+		return 0x04;
+	case WPA2_PSK_AUTH:
+		return 0x05;
+	case WPA_AUTH_CCKM:
+		return 0x06;
+	case WPA2_AUTH_CCKM:
+		return 0x07;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int ath6kl_wmi_legacy_crypto(enum ath6kl_crypto_type crypto)
+{
+	switch (crypto) {
+	case NONE_CRYPT:
+		return 0x01;
+	case WEP_CRYPT:
+		return 0x02;
+	case TKIP_CRYPT:
+		return 0x03;
+	case AES_CRYPT:
+		return 0x04;
+	default:
+		return -EINVAL;
+	}
+}
+
 struct ath6kl_vif *ath6kl_get_vif_by_index(struct ath6kl *ar, u8 if_idx)
 {
 	struct ath6kl_vif *vif, *found = NULL;
@@ -242,6 +300,21 @@ int ath6kl_wmi_data_hdr_add(struct wmi *wmi, struct sk_buff *skb,
 	if (WARN_ON(skb == NULL || (if_idx > wmi->parent_dev->vif_max - 1)))
 		return -EINVAL;
 
+	if (ath6kl_wmi_legacy(wmi)) {
+		u8 *hdr;
+
+		if (WARN_ON(tx_meta_info))
+			return -EINVAL;
+
+		hdr = skb_push(skb, WMI_LEGACY_DATA_HDR_LEN);
+		hdr[0] = 0;	/* rssi */
+		hdr[1] = msg_type << WMI_DATA_HDR_MSG_TYPE_SHIFT;
+		if (flags & WMI_DATA_HDR_FLAGS_MORE)
+			hdr[1] |= WMI_DATA_HDR_MORE;
+
+		return 0;
+	}
+
 	if (tx_meta_info) {
 		ret = ath6kl_wmi_meta_add(wmi, skb, &meta_ver, tx_meta_info);
 		if (ret)
@@ -303,7 +376,7 @@ int ath6kl_wmi_implicit_create_pstream(struct wmi *wmi, u8 if_idx,
 	struct wmi_data_hdr *data_hdr;
 	struct ath6kl_llc_snap_hdr *llc_hdr;
 	struct wmi_create_pstream_cmd cmd;
-	u32 meta_size, hdr_size;
+	u32 meta_size, hdr_size, dhdr_size;
 	u16 ip_type = IP_ETHERTYPE;
 	u8 stream_exist, usr_pri;
 	u8 traffic_class = WMM_AC_BE;
@@ -315,8 +388,15 @@ int ath6kl_wmi_implicit_create_pstream(struct wmi *wmi, u8 if_idx,
 	datap = skb->data;
 	data_hdr = (struct wmi_data_hdr *) datap;
 
-	meta_size = ((le16_to_cpu(data_hdr->info2) >> WMI_DATA_HDR_META_SHIFT) &
-		     WMI_DATA_HDR_META_MASK) ? WMI_MAX_TX_META_SZ : 0;
+	if (ath6kl_wmi_legacy(wmi)) {
+		dhdr_size = WMI_LEGACY_DATA_HDR_LEN;
+		meta_size = 0;
+	} else {
+		dhdr_size = sizeof(struct wmi_data_hdr);
+		meta_size = ((le16_to_cpu(data_hdr->info2) >>
+			      WMI_DATA_HDR_META_SHIFT) &
+			     WMI_DATA_HDR_META_MASK) ? WMI_MAX_TX_META_SZ : 0;
+	}
 
 	if (!wmm_enabled) {
 		/* If WMM is disabled all traffic goes as BE traffic */
@@ -324,9 +404,7 @@ int ath6kl_wmi_implicit_create_pstream(struct wmi *wmi, u8 if_idx,
 	} else {
 		hdr_size = sizeof(struct ethhdr);
 
-		llc_hdr = (struct ath6kl_llc_snap_hdr *)(datap +
-							 sizeof(struct
-								wmi_data_hdr) +
+		llc_hdr = (struct ath6kl_llc_snap_hdr *)(datap + dhdr_size +
 							 meta_size + hdr_size);
 
 		if (llc_hdr->eth_type == htons(ip_type)) {
@@ -754,6 +832,18 @@ static int ath6kl_wmi_ready_event_rx(struct wmi *wmi, u8 *datap, int len)
 {
 	struct wmi_ready_event_2 *ev = (struct wmi_ready_event_2 *) datap;
 
+	if (ath6kl_wmi_legacy(wmi)) {
+		struct wmi_ready_event_legacy *lev = (void *) datap;
+
+		if (len < sizeof(*lev))
+			return -EINVAL;
+
+		ath6kl_ready_event(wmi->parent_dev, lev->mac_addr,
+				   le32_to_cpu(lev->sw_version), 0,
+				   lev->phy_cap);
+		return 0;
+	}
+
 	if (len < sizeof(struct wmi_ready_event_2))
 		return -EINVAL;
 
@@ -1106,46 +1196,68 @@ void ath6kl_wmi_sscan_timer(struct timer_list *t)
 static int ath6kl_wmi_bssinfo_event_rx(struct wmi *wmi, u8 *datap, int len,
 				       struct ath6kl_vif *vif)
 {
-	struct wmi_bss_info_hdr2 *bih;
 	u8 *buf;
 	struct ieee80211_channel *channel;
 	struct ath6kl *ar = wmi->parent_dev;
 	struct cfg80211_bss *bss;
+	const u8 *bssid;
+	u8 frame_type, snr;
+	int hdr_len;
+	u16 freq;
 
-	if (len <= sizeof(struct wmi_bss_info_hdr2))
-		return -EINVAL;
+	if (ath6kl_wmi_legacy(wmi)) {
+		struct wmi_bss_info_hdr_legacy *bih = (void *) datap;
 
-	bih = (struct wmi_bss_info_hdr2 *) datap;
-	buf = datap + sizeof(struct wmi_bss_info_hdr2);
-	len -= sizeof(struct wmi_bss_info_hdr2);
+		hdr_len = sizeof(*bih);
+		if (len <= hdr_len)
+			return -EINVAL;
+
+		freq = le16_to_cpu(bih->ch);
+		frame_type = bih->frame_type;
+		snr = bih->snr;
+		bssid = bih->bssid;
+	} else {
+		struct wmi_bss_info_hdr2 *bih = (void *) datap;
+
+		hdr_len = sizeof(*bih);
+		if (len <= hdr_len)
+			return -EINVAL;
+
+		freq = le16_to_cpu(bih->ch);
+		frame_type = bih->frame_type;
+		snr = bih->snr;
+		bssid = bih->bssid;
+	}
+
+	buf = datap + hdr_len;
+	len -= hdr_len;
 
 	ath6kl_dbg(ATH6KL_DBG_WMI,
 		   "bss info evt - ch %u, snr %d, rssi %d, bssid \"%pM\" "
 		   "frame_type=%d\n",
-		   bih->ch, bih->snr, bih->snr - 95, bih->bssid,
-		   bih->frame_type);
+		   freq, snr, snr - 95, bssid, frame_type);
 
-	if (bih->frame_type != BEACON_FTYPE &&
-	    bih->frame_type != PROBERESP_FTYPE)
+	if (frame_type != BEACON_FTYPE &&
+	    frame_type != PROBERESP_FTYPE)
 		return 0; /* Only update BSS table for now */
 
-	if (bih->frame_type == BEACON_FTYPE &&
+	if (frame_type == BEACON_FTYPE &&
 	    test_bit(CLEAR_BSSFILTER_ON_BEACON, &vif->flags)) {
 		clear_bit(CLEAR_BSSFILTER_ON_BEACON, &vif->flags);
 		ath6kl_wmi_bssfilter_cmd(ar->wmi, vif->fw_vif_idx,
 					 NONE_BSS_FILTER, 0);
 	}
 
-	channel = ieee80211_get_channel(ar->wiphy, le16_to_cpu(bih->ch));
+	channel = ieee80211_get_channel(ar->wiphy, freq);
 	if (channel == NULL)
 		return -EINVAL;
 
 	if (len < 8 + 2 + 2)
 		return -EINVAL;
 
-	if (bih->frame_type == BEACON_FTYPE &&
+	if (frame_type == BEACON_FTYPE &&
 	    test_bit(CONNECTED, &vif->flags) &&
-	    memcmp(bih->bssid, vif->bssid, ETH_ALEN) == 0) {
+	    memcmp(bssid, vif->bssid, ETH_ALEN) == 0) {
 		const u8 *tim;
 		tim = cfg80211_find_ie(WLAN_EID_TIM, buf + 8 + 2 + 2,
 				       len - 8 - 2 - 2);
@@ -1156,14 +1268,14 @@ static int ath6kl_wmi_bssinfo_event_rx(struct wmi *wmi, u8 *datap, int len,
 	}
 
 	bss = cfg80211_inform_bss(ar->wiphy, channel,
-				  bih->frame_type == BEACON_FTYPE ?
+				  frame_type == BEACON_FTYPE ?
 					CFG80211_BSS_FTYPE_BEACON :
 					CFG80211_BSS_FTYPE_PRESP,
-				  bih->bssid, get_unaligned_le64((__le64 *)buf),
+				  bssid, get_unaligned_le64((__le64 *)buf),
 				  get_unaligned_le16(((__le16 *)buf) + 5),
 				  get_unaligned_le16(((__le16 *)buf) + 4),
 				  buf + 8 + 2 + 2, len - 8 - 2 - 2,
-				  (bih->snr - 95) * 100, GFP_ATOMIC);
+				  (snr - 95) * 100, GFP_ATOMIC);
 	if (bss == NULL)
 		return -ENOMEM;
 	cfg80211_put_bss(ar->wiphy, bss);
@@ -1295,13 +1407,17 @@ static int ath6kl_wmi_scan_complete_rx(struct wmi *wmi, u8 *datap, int len,
 				       struct ath6kl_vif *vif)
 {
 	struct wmi_scan_complete_event *ev;
+	s32 status = WMI_SCAN_STATUS_SUCCESS;
 
-	if (len < sizeof(*ev))
+	if (len >= sizeof(*ev)) {
+		ev = (struct wmi_scan_complete_event *) datap;
+		status = a_sle32_to_cpu(ev->status);
+	} else if (!ath6kl_wmi_legacy(wmi)) {
+		/* older WMI 2.x firmware sends no status */
 		return -EINVAL;
+	}
 
-	ev = (struct wmi_scan_complete_event *) datap;
-
-	ath6kl_scan_complete_evt(vif, a_sle32_to_cpu(ev->status));
+	ath6kl_scan_complete_evt(vif, status);
 	wmi->is_probe_ssid = false;
 
 	return 0;
@@ -1367,9 +1483,42 @@ static int ath6kl_wmi_error_event_rx(struct wmi *wmi, u8 *datap, int len)
 	return 0;
 }
 
+/* Convert WMI 2.x statistics to the current layout */
+static int ath6kl_wmi_legacy_stats_event_rx(struct wmi *wmi, u8 *datap,
+					    int len, struct ath6kl_vif *vif)
+{
+	struct wmi_target_stats_legacy *ev = (void *) datap;
+	struct wmi_target_stats stats = {};
+	int tail;
+
+	if (len < sizeof(*ev))
+		return -EINVAL;
+
+	tail = len - sizeof(*ev);
+	if (tail == sizeof(stats.arp_stats) + sizeof(stats.cserv_stats))
+		memcpy(&stats.arp_stats, ev->tail, sizeof(stats.arp_stats));
+	else if (tail != sizeof(stats.cserv_stats))
+		return -EINVAL;
+
+	stats.lq_val = ev->lq_val;
+	stats.noise_floor_calib = ev->noise_floor_calib;
+	stats.pm_stats.pwr_save_failure_cnt = ev->pwr_save_failure_cnt;
+	stats.stats = ev->stats;
+	stats.wow_stats = ev->wow_stats;
+	memcpy(&stats.cserv_stats, ev->tail + tail - sizeof(stats.cserv_stats),
+	       sizeof(stats.cserv_stats));
+
+	ath6kl_tgt_stats_event(vif, (u8 *) &stats, sizeof(stats));
+
+	return 0;
+}
+
 static int ath6kl_wmi_stats_event_rx(struct wmi *wmi, u8 *datap, int len,
 				     struct ath6kl_vif *vif)
 {
+	if (ath6kl_wmi_legacy(wmi))
+		return ath6kl_wmi_legacy_stats_event_rx(wmi, datap, len, vif);
+
 	ath6kl_tgt_stats_event(vif, datap, len);
 
 	return 0;
@@ -1823,6 +1972,13 @@ int ath6kl_wmi_cmd_send(struct wmi *wmi, u8 if_idx, struct sk_buff *skb,
 		return -EINVAL;
 	}
 
+	if (ath6kl_wmi_legacy(wmi) && !ath6kl_wmi_legacy_cmd(cmd_id)) {
+		ath6kl_dbg(ATH6KL_DBG_WMI, "wmi 2.x has no command %d\n",
+			   cmd_id);
+		dev_kfree_skb(skb);
+		return -EOPNOTSUPP;
+	}
+
 	if ((sync_flag == SYNC_BEFORE_WMIFLAG) ||
 	    (sync_flag == SYNC_BOTH_WMIFLAG)) {
 		/*
@@ -1832,12 +1988,17 @@ int ath6kl_wmi_cmd_send(struct wmi *wmi, u8 if_idx, struct sk_buff *skb,
 		ath6kl_wmi_sync_point(wmi, if_idx);
 	}
 
-	skb_push(skb, sizeof(struct wmi_cmd_hdr));
+	if (ath6kl_wmi_legacy(wmi)) {
+		put_unaligned_le16(cmd_id,
+				   skb_push(skb, WMI_LEGACY_CMD_HDR_LEN));
+	} else {
+		skb_push(skb, sizeof(struct wmi_cmd_hdr));
 
-	cmd_hdr = (struct wmi_cmd_hdr *) skb->data;
-	cmd_hdr->cmd_id = cpu_to_le16(cmd_id);
-	info1 = if_idx & WMI_CMD_HDR_IF_ID_MASK;
-	cmd_hdr->info1 = cpu_to_le16(info1);
+		cmd_hdr = (struct wmi_cmd_hdr *) skb->data;
+		cmd_hdr->cmd_id = cpu_to_le16(cmd_id);
+		info1 = if_idx & WMI_CMD_HDR_IF_ID_MASK;
+		cmd_hdr->info1 = cpu_to_le16(info1);
+	}
 
 	/* Only for OPT_TX_CMD, use BE endpoint. */
 	if (cmd_id == WMI_OPT_TX_FRAME_CMDID) {
@@ -1877,6 +2038,7 @@ int ath6kl_wmi_connect_cmd(struct wmi *wmi, u8 if_idx,
 {
 	struct sk_buff *skb;
 	struct wmi_connect_cmd *cc;
+	int legacy_auth = 0, legacy_prwise = 0, legacy_grp = 0;
 	int ret;
 
 	ath6kl_dbg(ATH6KL_DBG_WMI,
@@ -1893,6 +2055,14 @@ int ath6kl_wmi_connect_cmd(struct wmi *wmi, u8 if_idx,
 
 	if ((pairwise_crypto != NONE_CRYPT) && (group_crypto == NONE_CRYPT))
 		return -EINVAL;
+
+	if (ath6kl_wmi_legacy(wmi)) {
+		legacy_auth = ath6kl_wmi_legacy_auth(auth_mode);
+		legacy_prwise = ath6kl_wmi_legacy_crypto(pairwise_crypto);
+		legacy_grp = ath6kl_wmi_legacy_crypto(group_crypto);
+		if (legacy_auth < 0 || legacy_prwise < 0 || legacy_grp < 0)
+			return -EINVAL;
+	}
 
 	skb = ath6kl_wmi_get_new_buf(sizeof(struct wmi_connect_cmd));
 	if (!skb)
@@ -1917,6 +2087,16 @@ int ath6kl_wmi_connect_cmd(struct wmi *wmi, u8 if_idx,
 
 	if (bssid != NULL)
 		memcpy(cc->bssid, bssid, ETH_ALEN);
+
+	if (ath6kl_wmi_legacy(wmi)) {
+		cc->auth_mode = legacy_auth;
+		cc->prwise_crypto_type = legacy_prwise;
+		cc->grp_crypto_type = legacy_grp;
+		cc->ctrl_flags = cpu_to_le32(ctrl_flags &
+					     WMI_LEGACY_CONNECT_CTRL_FLAGS);
+		/* no nw_subtype in the WMI 2.x command */
+		skb_trim(skb, offsetof(struct wmi_connect_cmd, nw_subtype));
+	}
 
 	ret = ath6kl_wmi_cmd_send(wmi, if_idx, skb, WMI_CONNECT_CMDID,
 				  NO_SYNC_WMIFLAG);
@@ -1979,7 +2159,7 @@ static int ath6kl_wmi_startscan_cmd(struct wmi *wmi, u8 if_idx,
 {
 	struct sk_buff *skb;
 	struct wmi_start_scan_cmd *sc;
-	int i, ret;
+	int i, ret, slots = num_chan;
 
 	if ((scan_type != WMI_LONG_SCAN) && (scan_type != WMI_SHORT_SCAN))
 		return -EINVAL;
@@ -1987,7 +2167,14 @@ static int ath6kl_wmi_startscan_cmd(struct wmi *wmi, u8 if_idx,
 	if (num_chan > WMI_MAX_CHANNELS)
 		return -EINVAL;
 
-	skb = ath6kl_wmi_get_new_buf(struct_size(sc, ch_list, num_chan));
+	/*
+	 * The WMI 2.x command structure declares one channel slot; keep it
+	 * when no channels follow, as the vendor driver sends it.
+	 */
+	if (!slots && ath6kl_wmi_legacy(wmi))
+		slots = 1;
+
+	skb = ath6kl_wmi_get_new_buf(struct_size(sc, ch_list, slots));
 	if (!skb)
 		return -ENOMEM;
 
@@ -2173,6 +2360,13 @@ int ath6kl_wmi_probedssid_cmd(struct wmi *wmi, u8 if_idx, u8 index, u8 flag,
 	if (index >= MAX_PROBED_SSIDS)
 		return -EINVAL;
 
+	/*
+	 * WMI 2.x has only six entries; max_scan_ssids keeps the others
+	 * unused, so there is nothing to clear there.
+	 */
+	if (ath6kl_wmi_legacy(wmi) && index >= WMI_LEGACY_MAX_PROBED_SSIDS)
+		return flag == DISABLE_SSID_FLAG ? 0 : -EINVAL;
+
 	if (ssid_len > sizeof(cmd->ssid))
 		return -EINVAL;
 
@@ -2318,7 +2512,7 @@ int ath6kl_wmi_addkey_cmd(struct wmi *wmi, u8 if_idx, u8 key_index,
 {
 	struct sk_buff *skb;
 	struct wmi_add_cipher_key_cmd *cmd;
-	int ret;
+	int ret, wire_type = key_type;
 
 	ath6kl_dbg(ATH6KL_DBG_WMI,
 		   "addkey cmd: key_index=%u key_type=%d key_usage=%d key_len=%d key_op_ctrl=%d\n",
@@ -2331,13 +2525,19 @@ int ath6kl_wmi_addkey_cmd(struct wmi *wmi, u8 if_idx, u8 key_index,
 	if ((WEP_CRYPT != key_type) && (NULL == key_rsc))
 		return -EINVAL;
 
+	if (ath6kl_wmi_legacy(wmi)) {
+		wire_type = ath6kl_wmi_legacy_crypto(key_type);
+		if (wire_type < 0)
+			return -EINVAL;
+	}
+
 	skb = ath6kl_wmi_get_new_buf(sizeof(*cmd));
 	if (!skb)
 		return -ENOMEM;
 
 	cmd = (struct wmi_add_cipher_key_cmd *) skb->data;
 	cmd->key_index = key_index;
-	cmd->key_type = key_type;
+	cmd->key_type = wire_type;
 	cmd->key_usage = key_usage;
 	cmd->key_len = key_len;
 	memcpy(cmd->key, key_material, key_len);
@@ -2433,7 +2633,6 @@ int ath6kl_wmi_setpmkid_cmd(struct wmi *wmi, u8 if_idx, const u8 *bssid,
 static int ath6kl_wmi_data_sync_send(struct wmi *wmi, struct sk_buff *skb,
 			      enum htc_endpoint_id ep_id, u8 if_idx)
 {
-	struct wmi_data_hdr *data_hdr;
 	int ret;
 
 	if (WARN_ON(skb == NULL || ep_id == wmi->ep_id)) {
@@ -2441,11 +2640,13 @@ static int ath6kl_wmi_data_sync_send(struct wmi *wmi, struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	skb_push(skb, sizeof(struct wmi_data_hdr));
-
-	data_hdr = (struct wmi_data_hdr *) skb->data;
-	data_hdr->info = SYNC_MSGTYPE << WMI_DATA_HDR_MSG_TYPE_SHIFT;
-	data_hdr->info3 = cpu_to_le16(if_idx & WMI_DATA_HDR_IF_IDX_MASK);
+	ret = ath6kl_wmi_data_hdr_add(wmi, skb, SYNC_MSGTYPE, 0,
+				      WMI_DATA_HDR_DATA_TYPE_802_3, 0, NULL,
+				      if_idx);
+	if (ret) {
+		dev_kfree_skb(skb);
+		return ret;
+	}
 
 	ret = ath6kl_control_tx(wmi->parent_dev, skb, ep_id);
 
@@ -2879,6 +3080,10 @@ int ath6kl_wmi_set_bitrate_mask(struct wmi *wmi, u8 if_idx,
 				const struct cfg80211_bitrate_mask *mask)
 {
 	struct ath6kl *ar = wmi->parent_dev;
+
+	/* WMI 2.x only has WMI_SET_BITRATE with fixed rate indexes */
+	if (ath6kl_wmi_legacy(wmi))
+		return -EOPNOTSUPP;
 
 	if (test_bit(ATH6KL_FW_CAPABILITY_64BIT_RATES,
 		     ar->fw_capabilities))
@@ -3998,17 +4203,34 @@ static int ath6kl_wmi_proc_events(struct wmi *wmi, struct sk_buff *skb)
 	u8 if_idx;
 	u8 *datap;
 
-	cmd = (struct wmi_cmd_hdr *) skb->data;
-	id = le16_to_cpu(cmd->cmd_id);
-	if_idx = le16_to_cpu(cmd->info1) & WMI_CMD_HDR_IF_ID_MASK;
+	if (ath6kl_wmi_legacy(wmi)) {
+		id = get_unaligned_le16(skb->data);
+		if_idx = 0;
+		skb_pull(skb, WMI_LEGACY_CMD_HDR_LEN);
+	} else {
+		cmd = (struct wmi_cmd_hdr *) skb->data;
+		id = le16_to_cpu(cmd->cmd_id);
+		if_idx = le16_to_cpu(cmd->info1) & WMI_CMD_HDR_IF_ID_MASK;
 
-	skb_pull(skb, sizeof(struct wmi_cmd_hdr));
+		skb_pull(skb, sizeof(struct wmi_cmd_hdr));
+	}
 	datap = skb->data;
 	len = skb->len;
 
 	ath6kl_dbg(ATH6KL_DBG_WMI, "wmi rx id %d len %d\n", id, len);
 	ath6kl_dbg_dump(ATH6KL_DBG_WMI_DUMP, NULL, "wmi rx ",
 			datap, len);
+
+	/*
+	 * WMI 2.x events end with WMI_ACM_REJECT_EVENTID, which has the
+	 * number of WMI_ADDBA_REQ_EVENTID; none of the later ones exist.
+	 */
+	if (ath6kl_wmi_legacy(wmi) && (id & 0xf000) == 0x1000 &&
+	    id >= WMI_ADDBA_REQ_EVENTID) {
+		ath6kl_dbg(ATH6KL_DBG_WMI, "ignoring wmi 2.x event 0x%x\n", id);
+		dev_kfree_skb(skb);
+		return 0;
+	}
 
 	switch (id) {
 	case WMI_GET_BITRATE_CMDID:
@@ -4143,7 +4365,8 @@ int ath6kl_wmi_control_rx(struct wmi *wmi, struct sk_buff *skb)
 	if (WARN_ON(skb == NULL))
 		return -EINVAL;
 
-	if (skb->len < sizeof(struct wmi_cmd_hdr)) {
+	if (skb->len < (ath6kl_wmi_legacy(wmi) ? WMI_LEGACY_CMD_HDR_LEN :
+			sizeof(struct wmi_cmd_hdr))) {
 		ath6kl_err("bad packet 1\n");
 		dev_kfree_skb(skb);
 		return -EINVAL;

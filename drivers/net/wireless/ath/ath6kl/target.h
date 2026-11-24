@@ -18,6 +18,9 @@
 #ifndef TARGET_H
 #define TARGET_H
 
+/* AR6002 has no extended board data */
+#define AR6002_BOARD_DATA_SZ		768
+
 #define AR6003_BOARD_DATA_SZ		1024
 #define AR6003_BOARD_EXT_DATA_SZ	768
 #define AR6003_BOARD_EXT_DATA_SZ_V2	1024
@@ -141,6 +144,7 @@
  * between the two, and is intended to remain constant (with additions only
  * at the end).
  */
+#define ATH6KL_AR6002_HI_START_ADDR           0x00500400
 #define ATH6KL_AR6003_HI_START_ADDR           0x00540600
 #define ATH6KL_AR6004_HI_START_ADDR           0x00400800
 
@@ -303,6 +307,13 @@ struct host_interest {
 
 #define HI_OPTION_MAC_ADDR_METHOD_SHIFT	3
 
+/*
+ * AR6002 firmware (WMI 2.x): enable the timer workaround, firmware mode
+ * in bits 4:3. The AR6002 host interest area ends at hi_ext_clk_detected.
+ */
+#define HI_OPTION_TIMER_WAR		0x1
+#define AR6002_HI_OPTION_FW_MODE_SHIFT	3
+
 #define HI_OPTION_FW_MODE_IBSS    0x0
 #define HI_OPTION_FW_MODE_BSS_STA 0x1
 #define HI_OPTION_FW_MODE_AP      0x2
@@ -330,12 +341,14 @@ struct host_interest {
 #define HI_OPTION_FW_SUBMODE_SHIFT     0x14
 
 /* Convert a Target virtual address into a Target physical address */
+#define AR6002_VTOP(vaddr) ((vaddr) & 0x001fffff)
 #define AR6003_VTOP(vaddr) ((vaddr) & 0x001fffff)
 #define AR6004_VTOP(vaddr) (vaddr)
 
 #define TARG_VTOP(target_type, vaddr) \
+	(((target_type) == TARGET_TYPE_AR6002) ? AR6002_VTOP(vaddr) : \
 	(((target_type) == TARGET_TYPE_AR6003) ? AR6003_VTOP(vaddr) : \
-	(((target_type) == TARGET_TYPE_AR6004) ? AR6004_VTOP(vaddr) : 0))
+	(((target_type) == TARGET_TYPE_AR6004) ? AR6004_VTOP(vaddr) : 0)))
 
 #define ATH6KL_FWLOG_PAYLOAD_SIZE		1500
 

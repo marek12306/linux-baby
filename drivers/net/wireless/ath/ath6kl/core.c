@@ -141,6 +141,11 @@ int ath6kl_core_init(struct ath6kl *ar, enum ath6kl_htc_type htc_type)
 				  ar->fw_capabilities);
 	}
 
+	/* The WMI 2.x firmware has no checksum offload metadata */
+	if (ar->hw.flags & ATH6KL_HW_LEGACY_WMI)
+		__set_bit(ATH6KL_FW_CAPABILITY_NO_IP_CHECKSUM,
+			  ar->fw_capabilities);
+
 	/* Indicate that WMI is enabled (although not ready yet) */
 	set_bit(WMI_ENABLED, &ar->flag);
 	ar->wmi = ath6kl_wmi_init(ar);
