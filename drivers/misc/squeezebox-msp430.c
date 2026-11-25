@@ -5,10 +5,10 @@
  * The MSP430 owns the rotary encoders, IR receiver, RTC, and battery/charger
  * telemetry. RTC and system power-off use their native kernel frameworks.
  *
- * Input events, telemetry attributes, the driver name and the
+ * Input events, telemetry and charger attributes, the driver name and the
  * /sys/devices/platform/i2c-adapter:i2c-N path reproduce the SqueezeOS 7.x
- * (2.6.26) ABI consumed by SqueezePlay and monitor_msp430. Charger controls
- * and MSP430 firmware programming are deliberately excluded.
+ * (2.6.26) ABI consumed by SqueezePlay and monitor_msp430. MSP430 firmware
+ * programming is deliberately excluded.
  */
 
 #include <linux/bitops.h>
@@ -37,9 +37,12 @@
 #define MSP430_AMBIENT_REG		40
 #define MSP430_BATTERY_CHARGE_REG	50
 #define MSP430_BATTERY_CAPACITY_REG	52
+#define MSP430_BATTERY_CHARGE_DISABLE_REG 54
 #define MSP430_BATTERY_VOLTAGE_REG	55
 #define MSP430_SYSTEM_VOLTAGE_REG	57
+#define MSP430_BATTERY_DISCHARGE_RATE_REG 58
 #define MSP430_BATTERY_VMON1_REG	59
+#define MSP430_BATTERY_CHARGE_RATE_REG	60
 #define MSP430_BATTERY_VMON2_REG	61
 #define MSP430_BATTERY_TEMPERATURE_REG	62
 #define MSP430_WALL_VOLTAGE_REG	63
@@ -268,25 +271,31 @@ static ssize_t squeezebox_msp430_show_register(struct device *dev,
 }
 
 /*
- * SqueezePlay arms the wake alarm with an epoch time and clears it with
- * 4294967295. The RTC-class alarm writes the same register.
+ * Legacy format: an unsigned decimal written to the register as a
+ * little-endian value of the register's width. The MSP430 firmware
+ * interprets it.
  */
-static ssize_t squeezebox_msp430_store_alarm_time(struct device *dev,
+static ssize_t squeezebox_msp430_store_register(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
+	struct squeezebox_msp430_attribute *msp_attr =
+		container_of(attr, struct squeezebox_msp430_attribute, dev_attr);
 	struct squeezebox_msp430 *msp = dev_get_drvdata(dev);
 	u8 value[4];
-	u32 seconds;
-	int ret;
+	u32 number;
+	int i, ret;
 
-	ret = kstrtou32(buf, 10, &seconds);
+	ret = kstrtou32(buf, 10, &number);
 	if (ret)
 		return ret;
+	if (msp_attr->len < 4 && number >> (8 * msp_attr->len))
+		return -ERANGE;
 
-	put_unaligned_le32(seconds, value);
+	for (i = 0; i < msp_attr->len; i++)
+		value[i] = number >> (8 * i);
 
 	mutex_lock(&msp->lock);
-	ret = squeezebox_msp430_write(msp, MSP430_ALARM_REG, value, sizeof(value));
+	ret = squeezebox_msp430_write(msp, msp_attr->reg, value, msp_attr->len);
 	mutex_unlock(&msp->lock);
 
 	return ret ? ret : count;
@@ -299,10 +308,17 @@ static ssize_t squeezebox_msp430_store_alarm_time(struct device *dev,
 		.len = _len, \
 	}
 
+/* Root-writable, as S_IWUSR in the legacy driver. */
+#define MSP430_ATTR_RW(_name, _reg, _len) \
+	static struct squeezebox_msp430_attribute msp430_attr_##_name = { \
+		.dev_attr = __ATTR(_name, 0644, squeezebox_msp430_show_register, \
+				   squeezebox_msp430_store_register), \
+		.reg = _reg, \
+		.len = _len, \
+	}
+
 MSP430_ATTR(fw, MSP430_VERSION_REG, 2);
 MSP430_ATTR(ambient, MSP430_AMBIENT_REG, 4);
-MSP430_ATTR(battery_charge, MSP430_BATTERY_CHARGE_REG, 2);
-MSP430_ATTR(battery_capacity, MSP430_BATTERY_CAPACITY_REG, 2);
 MSP430_ATTR(battery_voltage, MSP430_BATTERY_VOLTAGE_REG, 2);
 MSP430_ATTR(sys_voltage, MSP430_SYSTEM_VOLTAGE_REG, 2);
 MSP430_ATTR(battery_vmon1_voltage, MSP430_BATTERY_VMON1_REG, 2);
@@ -313,18 +329,27 @@ MSP430_ATTR(charger_event, MSP430_CHARGER_EVENT_REG, 2);
 MSP430_ATTR(charger_state, MSP430_CHARGER_STATE_REG, 2);
 MSP430_ATTR(power_mode, MSP430_POWER_MODE_REG, 2);
 
-static struct squeezebox_msp430_attribute msp430_attr_alarm_time = {
-	.dev_attr = __ATTR(alarm_time, 0644, squeezebox_msp430_show_register,
-			   squeezebox_msp430_store_alarm_time),
-	.reg = MSP430_ALARM_REG,
-	.len = 4,
-};
+/* Charger controls (legacy msp430-charger-addons) */
+MSP430_ATTR_RW(battery_charge, MSP430_BATTERY_CHARGE_REG, 2);
+MSP430_ATTR_RW(battery_capacity, MSP430_BATTERY_CAPACITY_REG, 2);
+MSP430_ATTR_RW(battery_disable, MSP430_BATTERY_CHARGE_DISABLE_REG, 1);
+MSP430_ATTR_RW(battery_charge_rate, MSP430_BATTERY_CHARGE_RATE_REG, 2);
+MSP430_ATTR_RW(battery_discharge_rate, MSP430_BATTERY_DISCHARGE_RATE_REG, 2);
+
+/*
+ * SqueezePlay arms the wake alarm with an epoch time and clears it with
+ * 4294967295. The RTC-class alarm writes the same register.
+ */
+MSP430_ATTR_RW(alarm_time, MSP430_ALARM_REG, 4);
 
 static struct attribute *squeezebox_msp430_attrs[] = {
 	&msp430_attr_fw.dev_attr.attr,
 	&msp430_attr_ambient.dev_attr.attr,
 	&msp430_attr_battery_charge.dev_attr.attr,
 	&msp430_attr_battery_capacity.dev_attr.attr,
+	&msp430_attr_battery_disable.dev_attr.attr,
+	&msp430_attr_battery_charge_rate.dev_attr.attr,
+	&msp430_attr_battery_discharge_rate.dev_attr.attr,
 	&msp430_attr_battery_voltage.dev_attr.attr,
 	&msp430_attr_sys_voltage.dev_attr.attr,
 	&msp430_attr_battery_vmon1_voltage.dev_attr.attr,
