@@ -39,6 +39,9 @@
 #define CCM_LTR3	0x4c
 #define CCM_MCR		0x64
 
+#define CCTL_LP_CTL_MASK	(0x3 << 24)
+#define CCTL_LP_CTL_WAIT	(0x1 << 24)
+
 #define ccm(x)	(ccm_base + (x))
 
 static struct clk_onecell_data clk_data;
@@ -210,6 +213,16 @@ static void __init __mx25_clocks_init(void __iomem *ccm_base)
 	imx_check_clocks(clk, ARRAY_SIZE(clk));
 
 	clk_prepare_enable(clk[emi_ahb]);
+
+	/*
+	 * Gate the ARM clock while the core waits for an interrupt (CCTL
+	 * LP_CTL = WAIT), as the Freescale BSP's arch_idle() did; in RUN mode
+	 * the core keeps its clock in WFI. MAX and the peripheral clocks keep
+	 * running, and the platform interrupt controller restarts the core
+	 * clock, so the LPIMR wake-up masks (for doze and stop) do not apply.
+	 */
+	writel((readl(ccm(CCM_CCTL)) & ~CCTL_LP_CTL_MASK) | CCTL_LP_CTL_WAIT,
+	       ccm(CCM_CCTL));
 
 	/* Clock source for gpt must be derived from AHB */
 	clk_set_parent(clk[per5_sel], clk[ahb]);
